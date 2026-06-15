@@ -1,0 +1,31 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+venv/
+*.egg-info/
+
+# Environment
+.env
+
+# IDE
+.idea/
+.vscode/
+*.iml
+
+# Docker
+.docker/
+
+# Review artifacts
+review_output.txt
+
+# HuggingFace model cache
+.hf_cache/
+
+# Alembic compiled
+alembic/__pycache__/
+alembic/versions/__pycache__/
+
+# Pytest
+.pytest_cache/
