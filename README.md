@@ -2,7 +2,8 @@
 
 [![CI](https://img.shields.io/github/actions/workflow/status/KulakovVladislav/rag-api/ci.yml?branch=main&label=CI)](https://github.com/KulakovVladislav/rag-api/actions)
 
-A production-ready Retrieval-Augmented Generation API built with **FastAPI**, **PostgreSQL + pgvector**, and **local sentence-transformers** embeddings. Upload documents, search them semantically — no OpenAI key required.
+A production-ready Retrieval-Augmented Generation API built with **FastAPI**, **PostgreSQL + pgvector**, and **local
+sentence-transformers** embeddings. Upload documents, search them semantically — no OpenAI key required.
 
 ---
 
@@ -32,16 +33,16 @@ RAG API implements the core pipeline of a document question-answering system:
 
 ## Tech Stack
 
-| Layer | Technology |
-|---|---|
-| API | FastAPI + Gunicorn / Uvicorn |
-| Vector Storage | PostgreSQL 17 + pgvector |
-| Embeddings | sentence-transformers (`all-MiniLM-L6-v2`) |
-| Cache | Redis |
-| Migrations | Alembic |
-| Reverse Proxy | Nginx |
-| Infrastructure | Docker Compose |
-| Testing | Pytest + isolated PostgreSQL container |
+| Layer          | Technology                                 |
+|----------------|--------------------------------------------|
+| API            | FastAPI + Gunicorn / Uvicorn               |
+| Vector Storage | PostgreSQL 17 + pgvector                   |
+| Embeddings     | sentence-transformers (`all-MiniLM-L6-v2`) |
+| Cache          | Redis                                      |
+| Migrations     | Alembic                                    |
+| Reverse Proxy  | Nginx                                      |
+| Infrastructure | Docker Compose                             |
+| Testing        | Pytest + isolated PostgreSQL container     |
 
 ---
 
@@ -118,9 +119,9 @@ cp .env.example .env
 docker compose up --build
 ```
 
-| | |
-|---|---|
-| API | `http://localhost:8080` |
+|            |                              |
+|------------|------------------------------|
+| API        | `http://localhost:8080`      |
 | Swagger UI | `http://localhost:8080/docs` |
 
 ---
@@ -132,6 +133,7 @@ docker compose up --build
 Ingest a document — chunks it, generates embeddings, and stores everything in PostgreSQL.
 
 **Request**
+
 ```json
 {
   "title": "FastAPI Guide",
@@ -140,6 +142,7 @@ Ingest a document — chunks it, generates embeddings, and stores everything in 
 ```
 
 **Response `201`**
+
 ```json
 {
   "id": 1,
@@ -156,12 +159,13 @@ Semantic search over stored chunks.
 
 **Query parameters**
 
-| Parameter | Type | Default | Description |
-|---|---|---|---|
-| `q` | string | required | Search query |
-| `top_k` | integer | `5` | Number of results to return |
+| Parameter | Type    | Default  | Description                 |
+|-----------|---------|----------|-----------------------------|
+| `q`       | string  | required | Search query                |
+| `top_k`   | integer | `5`      | Number of results to return |
 
 **Response `200`**
+
 ```json
 [
   {
@@ -197,15 +201,20 @@ See `.env.example` for all required variables with descriptions.
 
 **pgvector over a dedicated vector DB (Pinecone, Weaviate)**
 
-At this scale, PostgreSQL + pgvector eliminates the operational overhead of running a separate service. The HNSW index delivers sub-millisecond search. A dedicated vector DB becomes worthwhile at 10M+ vectors or when multi-tenancy grows complex.
+At this scale, PostgreSQL + pgvector eliminates the operational overhead of running a separate service. The HNSW index
+delivers sub-millisecond search. A dedicated vector DB becomes worthwhile at 10M+ vectors or when multi-tenancy grows
+complex.
 
 **Local sentence-transformers over OpenAI embeddings**
 
-Zero API cost, zero external dependency, fully reproducible results. `all-MiniLM-L6-v2` produces 384-dimensional embeddings — smaller and faster than OpenAI's 1536-dimensional `text-embedding-ada-002`, with comparable quality for English retrieval.
+Zero API cost, zero external dependency, fully reproducible results. `all-MiniLM-L6-v2` produces 384-dimensional
+embeddings — smaller and faster than OpenAI's 1536-dimensional `text-embedding-ada-002`, with comparable quality for
+English retrieval.
 
 **HNSW index over IVFFlat**
 
-HNSW builds incrementally and works on an empty table. IVFFlat requires a `VACUUM ANALYZE` after bulk inserts to build clusters. HNSW uses more memory but delivers better query-time performance and simpler operational behaviour.
+HNSW builds incrementally and works on an empty table. IVFFlat requires a `VACUUM ANALYZE` after bulk inserts to build
+clusters. HNSW uses more memory but delivers better query-time performance and simpler operational behaviour.
 
 ---
 

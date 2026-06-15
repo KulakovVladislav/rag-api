@@ -1,19 +1,12 @@
 from fastapi import APIRouter, Depends
-from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
 from app.database.db import get_db
 from app.database.models import Document, Chunk
+from app.schemas import SearchResult
 from app.services.embedding_service import get_embedding
 
 router = APIRouter()
-
-
-class SearchResult(BaseModel):
-    chunk_id: int
-    document_title: str
-    content: str
-    score: float
 
 
 @router.get("", response_model=list[SearchResult])

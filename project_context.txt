@@ -1,0 +1,1383 @@
+Project Path: rag-api
+
+Source Tree:
+
+```txt
+rag-api
+├── Dockerfile
+├── README.md
+├── alembic
+│   ├── README
+│   ├── env.py
+│   ├── script.py.mako
+│   └── versions
+│       └── 2a5d7faae137_init_documents_and_chunks.py
+├── alembic.ini
+├── app
+│   ├── __init__.py
+│   ├── api
+│   │   ├── __init__.py
+│   │   ├── documents.py
+│   │   └── search.py
+│   ├── config.py
+│   ├── core
+│   │   ├── __init__.py
+│   │   ├── context.py
+│   │   ├── logging.py
+│   │   └── middleware.py
+│   ├── database
+│   │   ├── __init__.py
+│   │   ├── base.py
+│   │   ├── db.py
+│   │   └── models.py
+│   ├── main.py
+│   ├── schemas.py
+│   └── services
+│       ├── __init__.py
+│       ├── chunking_service.py
+│       ├── document_service.py
+│       └── embedding_service.py
+├── docker-compose.test.yml
+├── docker-compose.yml
+├── entrypoint.sh
+├── nginx.conf
+├── project_context.txt
+├── requirements.txt
+└── tests
+    ├── __init__.py
+    └── test_api.py
+
+```
+
+`Dockerfile`:
+
+```
+FROM python:3.12-slim AS builder
+ENV PATH="/opt/venv/bin:$PATH"
+ENV HF_HOME=/app/.hf_cache
+WORKDIR /app
+RUN python -m venv /opt/venv
+COPY requirements.txt .
+RUN pip install --no-cache-dir --extra-index-url https://download.pytorch.org/whl/cpu -r requirements.txt
+RUN python -c "from sentence_transformers import SentenceTransformer; SentenceTransformer('all-MiniLM-L6-v2')"
+COPY . .
+
+FROM python:3.12-slim AS runner
+RUN apt-get update && apt-get install -y curl && rm -rf /var/lib/apt/lists/*
+RUN useradd --system -m --shell /bin/false appuser
+COPY --from=builder /opt/venv /opt/venv
+COPY --from=builder /app /app
+WORKDIR /app
+COPY entrypoint.sh .
+COPY app/ ./app/
+COPY alembic/ ./alembic/
+COPY alembic.ini .
+ENV HF_HOME=/app/.hf_cache
+ENV PATH="/opt/venv/bin:$PATH"
+RUN chmod +x entrypoint.sh && chown -R appuser:appuser /app
+USER appuser
+ENTRYPOINT ["./entrypoint.sh"]
+CMD ["gunicorn", "app.main:app", "--bind", "0.0.0.0:8000", "--workers", "2", "--worker-class", "uvicorn.workers.UvicornWorker", "--log-level", "info", "--access-logfile", "-", "--error-logfile", "-"]
+
+```
+
+`README.md`:
+
+```md
+# RAG API
+
+[![CI](https://img.shields.io/github/actions/workflow/status/KulakovVladislav/rag-api/ci.yml?branch=main&label=CI)](https://github.com/KulakovVladislav/rag-api/actions)
+
+A production-ready Retrieval-Augmented Generation API built with **FastAPI**, **PostgreSQL + pgvector**, and **local
+sentence-transformers** embeddings. Upload documents, search them semantically — no OpenAI key required.
+
+---
+
+## Table of Contents
+
+- [Overview](#overview)
+- [Tech Stack](#tech-stack)
+- [Architecture](#architecture)
+- [Project Structure](#project-structure)
+- [Getting Started](#getting-started)
+- [API Reference](#api-reference)
+- [Running Tests](#running-tests)
+- [Environment Variables](#environment-variables)
+- [Engineering Decisions](#engineering-decisions)
+
+---
+
+## Overview
+
+RAG API implements the core pipeline of a document question-answering system:
+
+- Documents are ingested, chunked, and converted into vector embeddings
+- Semantic search finds the most relevant chunks via cosine similarity
+- Everything runs locally — embeddings are generated with `sentence-transformers` (`all-MiniLM-L6-v2`)
+
+---
+
+## Tech Stack
+
+| Layer          | Technology                                 |
+|----------------|--------------------------------------------|
+| API            | FastAPI + Gunicorn / Uvicorn               |
+| Vector Storage | PostgreSQL 17 + pgvector                   |
+| Embeddings     | sentence-transformers (`all-MiniLM-L6-v2`) |
+| Cache          | Redis                                      |
+| Migrations     | Alembic                                    |
+| Reverse Proxy  | Nginx                                      |
+| Infrastructure | Docker Compose                             |
+| Testing        | Pytest + isolated PostgreSQL container     |
+
+---
+
+## Architecture
+
+```
+        Client
+          │
+          ▼ [Port 8080]
+┌─────────────────────────┐
+│   Nginx (Rate Limiting) │
+└────────────┬────────────┘
+             │ [Port 8000 – internal]
+┌────────────▼────────────┐
+│   FastAPI Application   │
+│  (Gunicorn + Uvicorn)   │
+└──────┬──────────┬───────┘
+       │          │
+┌──────▼───┐  ┌──▼─────┐
+│ Postgres  │  │ Redis  │
+│ pgvector  │  │ Cache  │
+└──────────┘  └────────┘
+```
+
+### RAG Pipeline
+
+```
+POST /api/documents
+  → chunk_text()         — splits content into overlapping chunks
+  → generate_embeddings() — encodes chunks via sentence-transformers
+  → store               — saves chunks to PostgreSQL with vector(384) column
+
+GET /api/search?q=...
+  → encode query         — converts query to vector
+  → cosine search        — pgvector <=> operator finds nearest neighbors
+  → return top-k chunks  — ranked by similarity score
+```
+
+---
+
+## Project Structure
+
+```
+rag-api/
+├── app/
+│   ├── api/
+│   │   ├── documents.py          # POST /api/documents
+│   │   └── search.py             # GET /api/search
+│   ├── database/
+│   │   ├── models.py             # Document, Chunk SQLAlchemy models
+│   │   ├── db.py                 # Session management
+│   │   └── base.py               # Declarative base
+│   ├── services/
+│   │   ├── embedding_service.py  # sentence-transformers wrapper
+│   │   └── chunking_service.py   # Text chunking logic
+│   ├── config.py                 # Pydantic settings
+│   └── main.py                   # FastAPI app, router registration
+├── alembic/                      # Database migrations
+├── tests/                        # Pytest test suite
+├── docker-compose.yml            # Production stack
+├── docker-compose.test.yml       # Isolated test stack
+├── Dockerfile                    # Multi-stage, non-root
+└── nginx.conf                    # Rate limiting, proxy config
+```
+
+---
+
+## Getting Started
+
+```bash
+cp .env.example .env
+# Edit .env with your values
+
+docker compose up --build
+```
+
+|            |                              |
+|------------|------------------------------|
+| API        | `http://localhost:8080`      |
+| Swagger UI | `http://localhost:8080/docs` |
+
+---
+
+## API Reference
+
+### `POST /api/documents`
+
+Ingest a document — chunks it, generates embeddings, and stores everything in PostgreSQL.
+
+**Request**
+
+```json
+{
+  "title": "FastAPI Guide",
+  "content": "FastAPI is a modern..."
+}
+```
+
+**Response `201`**
+
+```json
+{
+  "id": 1,
+  "title": "FastAPI Guide",
+  "chunk_count": 4
+}
+```
+
+---
+
+### `GET /api/search`
+
+Semantic search over stored chunks.
+
+**Query parameters**
+
+| Parameter | Type    | Default  | Description                 |
+|-----------|---------|----------|-----------------------------|
+| `q`       | string  | required | Search query                |
+| `top_k`   | integer | `5`      | Number of results to return |
+
+**Response `200`**
+
+```json
+[
+  {
+    "chunk_id": 3,
+    "document_title": "FastAPI Guide",
+    "content": "FastAPI is a modern web framework...",
+    "score": 0.12
+  }
+]
+```
+
+> Lower score = higher similarity (cosine distance).
+
+---
+
+## Running Tests
+
+Tests run against an isolated PostgreSQL container with `tmpfs` — no persistent data, no side effects.
+
+```bash
+docker compose -f docker-compose.test.yml up --build --abort-on-container-exit
+```
+
+---
+
+## Environment Variables
+
+See `.env.example` for all required variables with descriptions.
+
+---
+
+## Engineering Decisions
+
+**pgvector over a dedicated vector DB (Pinecone, Weaviate)**
+
+At this scale, PostgreSQL + pgvector eliminates the operational overhead of running a separate service. The HNSW index
+delivers sub-millisecond search. A dedicated vector DB becomes worthwhile at 10M+ vectors or when multi-tenancy grows
+complex.
+
+**Local sentence-transformers over OpenAI embeddings**
+
+Zero API cost, zero external dependency, fully reproducible results. `all-MiniLM-L6-v2` produces 384-dimensional
+embeddings — smaller and faster than OpenAI's 1536-dimensional `text-embedding-ada-002`, with comparable quality for
+English retrieval.
+
+**HNSW index over IVFFlat**
+
+HNSW builds incrementally and works on an empty table. IVFFlat requires a `VACUUM ANALYZE` after bulk inserts to build
+clusters. HNSW uses more memory but delivers better query-time performance and simpler operational behaviour.
+
+---
+
+## Author
+
+**Vladislav** — Backend Engineering · AI Systems · Vector Search
+
+```
+
+`alembic.ini`:
+
+```ini
+# A generic, single database configuration.
+
+[alembic]
+# path to migration scripts.
+# this is typically a path given in POSIX (e.g. forward slashes)
+# format, relative to the token %(here)s which refers to the location of this
+# ini file
+script_location = %(here)s/alembic
+
+# template used to generate migration file names; The default value is %%(rev)s_%%(slug)s
+# Uncomment the line below if you want the files to be prepended with date and time
+# see https://alembic.sqlalchemy.org/en/latest/tutorial.html#editing-the-ini-file
+# for all available tokens
+# file_template = %%(year)d_%%(month).2d_%%(day).2d_%%(hour).2d%%(minute).2d-%%(rev)s_%%(slug)s
+# Or organize into date-based subdirectories (requires recursive_version_locations = true)
+# file_template = %%(year)d/%%(month).2d/%%(day).2d_%%(hour).2d%%(minute).2d_%%(second).2d_%%(rev)s_%%(slug)s
+
+# sys.path path, will be prepended to sys.path if present.
+# defaults to the current working directory.  for multiple paths, the path separator
+# is defined by "path_separator" below.
+prepend_sys_path = .
+
+
+# timezone to use when rendering the date within the migration file
+# as well as the filename.
+# If specified, requires the tzdata library which can be installed by adding
+# `alembic[tz]` to the pip requirements.
+# string value is passed to ZoneInfo()
+# leave blank for localtime
+# timezone =
+
+# max length of characters to apply to the "slug" field
+# truncate_slug_length = 40
+
+# set to 'true' to run the environment during
+# the 'revision' command, regardless of autogenerate
+# revision_environment = false
+
+# set to 'true' to allow .pyc and .pyo files without
+# a source .py file to be detected as revisions in the
+# versions/ directory
+# sourceless = false
+
+# version location specification; This defaults
+# to <script_location>/versions.  When using multiple version
+# directories, initial revisions must be specified with --version-path.
+# The path separator used here should be the separator specified by "path_separator"
+# below.
+# version_locations = %(here)s/bar:%(here)s/bat:%(here)s/alembic/versions
+
+# path_separator; This indicates what character is used to split lists of file
+# paths, including version_locations and prepend_sys_path within configparser
+# files such as alembic.ini.
+# The default rendered in new alembic.ini files is "os", which uses os.pathsep
+# to provide os-dependent path splitting.
+#
+# Note that in order to support legacy alembic.ini files, this default does NOT
+# take place if path_separator is not present in alembic.ini.  If this
+# option is omitted entirely, fallback logic is as follows:
+#
+# 1. Parsing of the version_locations option falls back to using the legacy
+#    "version_path_separator" key, which if absent then falls back to the legacy
+#    behavior of splitting on spaces and/or commas.
+# 2. Parsing of the prepend_sys_path option falls back to the legacy
+#    behavior of splitting on spaces, commas, or colons.
+#
+# Valid values for path_separator are:
+#
+# path_separator = :
+# path_separator = ;
+# path_separator = space
+# path_separator = newline
+#
+# Use os.pathsep. Default configuration used for new projects.
+path_separator = os
+
+# set to 'true' to search source files recursively
+# in each "version_locations" directory
+# new in Alembic version 1.10
+# recursive_version_locations = false
+
+# the output encoding used when revision files
+# are written from script.py.mako
+# output_encoding = utf-8
+
+# database URL.  This is consumed by the user-maintained env.py script only.
+# other means of configuring database URLs may be customized within the env.py
+# file.
+sqlalchemy.url =
+[post_write_hooks]
+# post_write_hooks defines scripts or Python functions that are run
+# on newly generated revision scripts.  See the documentation for further
+# detail and examples
+
+# format using "black" - use the console_scripts runner, against the "black" entrypoint
+# hooks = black
+# black.type = console_scripts
+# black.entrypoint = black
+# black.options = -l 79 REVISION_SCRIPT_FILENAME
+
+# lint with attempts to fix using "ruff" - use the module runner, against the "ruff" module
+# hooks = ruff
+# ruff.type = module
+# ruff.module = ruff
+# ruff.options = check --fix REVISION_SCRIPT_FILENAME
+
+# Alternatively, use the exec runner to execute a binary found on your PATH
+# hooks = ruff
+# ruff.type = exec
+# ruff.executable = ruff
+# ruff.options = check --fix REVISION_SCRIPT_FILENAME
+
+# Logging configuration.  This is also consumed by the user-maintained
+# env.py script only.
+[loggers]
+keys = root,sqlalchemy,alembic
+
+[handlers]
+keys = console
+
+[formatters]
+keys = generic
+
+[logger_root]
+level = WARNING
+handlers = console
+qualname =
+
+[logger_sqlalchemy]
+level = WARNING
+handlers =
+qualname = sqlalchemy.engine
+
+[logger_alembic]
+level = INFO
+handlers =
+qualname = alembic
+
+[handler_console]
+class = StreamHandler
+args = (sys.stderr,)
+level = NOTSET
+formatter = generic
+
+[formatter_generic]
+format = %(levelname)-5.5s [%(name)s] %(message)s
+datefmt = %H:%M:%S
+
+```
+
+`alembic/README`:
+
+```
+Generic single-database configuration.
+```
+
+`alembic/env.py`:
+
+```py
+import os
+import sys
+
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
+from logging.config import fileConfig
+
+from alembic import context
+from sqlalchemy import engine_from_config, pool
+
+from app.database.base import Base
+
+config = context.config
+
+if config.config_file_name is not None:
+    fileConfig(config.config_file_name)
+
+
+def get_url():
+    user = os.getenv("POSTGRES_USER")
+    password = os.getenv("POSTGRES_PASSWORD")
+    host = os.getenv("POSTGRES_HOST", "db")
+    port = os.getenv("POSTGRES_PORT", "5432")
+    db = os.getenv("POSTGRES_DB")
+    return f"postgresql+psycopg2://{user}:{password}@{host}:{port}/{db}"
+
+
+def run_migrations_offline() -> None:
+    url = get_url()
+    context.configure(
+        url=url,
+        target_metadata=Base.metadata,
+        literal_binds=True,
+        dialect_opts={"paramstyle": "named"},
+    )
+    with context.begin_transaction():
+        context.run_migrations()
+
+
+def run_migrations_online() -> None:
+    configuration = config.get_section(config.config_ini_section) or {}
+    configuration["sqlalchemy.url"] = get_url()
+    connectable = engine_from_config(
+        configuration,
+        prefix="sqlalchemy.",
+        poolclass=pool.NullPool,
+    )
+    with connectable.connect() as connection:
+        context.configure(
+            connection=connection,
+            target_metadata=Base.metadata
+        )
+        with context.begin_transaction():
+            context.run_migrations()
+
+
+if context.is_offline_mode():
+    run_migrations_offline()
+else:
+    run_migrations_online()
+
+```
+
+`alembic/script.py.mako`:
+
+```mako
+"""${message}
+
+Revision ID: ${up_revision}
+Revises: ${down_revision | comma,n}
+Create Date: ${create_date}
+
+"""
+from typing import Sequence, Union
+
+from alembic import op
+import sqlalchemy as sa
+${imports if imports else ""}
+
+# revision identifiers, used by Alembic.
+revision: str = ${repr(up_revision)}
+down_revision: Union[str, Sequence[str], None] = ${repr(down_revision)}
+branch_labels: Union[str, Sequence[str], None] = ${repr(branch_labels)}
+depends_on: Union[str, Sequence[str], None] = ${repr(depends_on)}
+
+
+def upgrade() -> None:
+    """Upgrade schema."""
+    ${upgrades if upgrades else "pass"}
+
+
+def downgrade() -> None:
+    """Downgrade schema."""
+    ${downgrades if downgrades else "pass"}
+
+```
+
+`alembic/versions/2a5d7faae137_init_documents_and_chunks.py`:
+
+```py
+import sqlalchemy as sa
+from alembic import op
+from pgvector.sqlalchemy import Vector
+
+revision = '2a5d7faae137'
+down_revision = None
+branch_labels = None
+depends_on = None
+
+
+def upgrade() -> None:
+    op.execute("CREATE EXTENSION IF NOT EXISTS vector")
+
+    op.create_table(
+        'documents',
+        sa.Column('id', sa.Integer(), nullable=False),
+        sa.Column('title', sa.String(), nullable=False),
+        sa.Column('content', sa.Text(), nullable=False),
+        sa.PrimaryKeyConstraint('id')
+    )
+    op.create_index(op.f('ix_documents_id'), 'documents', ['id'], unique=False)
+
+    op.create_table(
+        'chunks',
+        sa.Column('id', sa.Integer(), nullable=False),
+        sa.Column('content', sa.Text(), nullable=False),
+        sa.Column('document_id', sa.Integer(), nullable=False),
+        sa.Column('embedding', Vector(384), nullable=False),
+        sa.ForeignKeyConstraint(['document_id'], ['documents.id'], ondelete='CASCADE'),
+        sa.PrimaryKeyConstraint('id')
+    )
+    op.create_index(op.f('ix_chunks_id'), 'chunks', ['id'], unique=False)
+    op.execute("""
+               CREATE INDEX chunks_embedding_hnsw_idx
+                   ON chunks USING hnsw (embedding vector_cosine_ops)
+                   WITH (m = 16, ef_construction = 64)
+               """)
+
+
+def downgrade() -> None:
+    op.execute("DROP INDEX IF EXISTS chunks_embedding_hnsw_idx")
+    op.drop_index(op.f('ix_chunks_id'), table_name='chunks')
+    op.drop_table('chunks')
+    op.drop_index(op.f('ix_documents_id'), table_name='documents')
+    op.drop_table('documents')
+
+```
+
+`app/api/documents.py`:
+
+```py
+from typing import List
+
+from fastapi import APIRouter, Depends, status, HTTPException, Response
+from fastapi import Query
+from sqlalchemy.orm import Session
+
+from app.database.db import get_db
+from app.database.models import Document, Chunk
+from app.schemas import DocumentCreate, DocumentResponse, DocumentListOut, DocumentDetail
+from app.services.chunking_service import chunk_text
+from app.services.document_service import get_documents, get_document_by_id, delete_document
+from app.services.embedding_service import get_embeddings
+
+router = APIRouter()
+
+
+@router.post("", status_code=status.HTTP_201_CREATED, response_model=DocumentResponse)
+async def create_document(payload: DocumentCreate, db: Session = Depends(get_db)):
+    db_document = Document(title=payload.title, content=payload.content)
+    db.add(db_document)
+    db.flush()
+    chunked_payload = chunk_text(payload.content)
+    vectors = await get_embeddings(chunked_payload)
+    chunks_to_insert = [
+        Chunk(content=c_content, document_id=db_document.id, embedding=vector)
+        for c_content, vector in zip(chunked_payload, vectors)
+    ]
+    db.add_all(chunks_to_insert)
+    db.commit()
+    return {
+        "id": db_document.id,
+        "title": db_document.title,
+        "chunk_count": len(chunked_payload)
+    }
+
+
+@router.get("", response_model=List[DocumentListOut])
+async def read_documents(
+        limit: int = Query(default=10, ge=1, le=100),
+        offset: int = Query(default=0, ge=0),
+        db: Session = Depends(get_db)
+):
+    documents = get_documents(db=db, limit=limit, offset=offset)
+    return [
+        {
+            "id": doc.id,
+            "title": doc.title,
+            "chunk_count": len(doc.chunks)
+        }
+        for doc in documents
+    ]
+
+
+@router.get("/{id}", response_model=DocumentDetail)
+async def read_document(id: int, db: Session = Depends(get_db)):
+    db_document = get_document_by_id(db=db, document_id=id)
+    if db_document is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Document not found"
+        )
+
+    return {
+        "id": db_document.id,
+        "title": db_document.title,
+        "chunk_count": len(db_document.chunks),
+        "content": db_document.content
+    }
+
+
+@router.delete("/{id}", status_code=status.HTTP_204_NO_CONTENT)
+async def remove_document(id: int, db: Session = Depends(get_db)):
+    success = delete_document(db=db, document_id=id)
+    if not success:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Document not found"
+        )
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+```
+
+`app/api/search.py`:
+
+```py
+from fastapi import APIRouter, Depends
+from sqlalchemy.orm import Session
+
+from app.database.db import get_db
+from app.database.models import Document, Chunk
+from app.schemas import SearchResult
+from app.services.embedding_service import get_embedding
+
+router = APIRouter()
+
+
+@router.get("", response_model=list[SearchResult])
+async def search(q: str, top_k: int = 5, db: Session = Depends(get_db)):
+    vector = await get_embedding(q)
+    distance = Chunk.embedding.cosine_distance(vector)
+    results = (
+        db.query(Chunk, Document.title, distance.label("score"))
+        .join(Document, Chunk.document_id == Document.id)
+        .order_by(distance)
+        .limit(top_k)
+        .all()
+    )
+    return [
+        {
+            "chunk_id": row.Chunk.id,
+            "document_title": row.title,
+            "content": row.Chunk.content,
+            "score": row.score
+        }
+        for row in results
+    ]
+
+```
+
+`app/config.py`:
+
+```py
+from pydantic import Field
+from pydantic_settings import BaseSettings, SettingsConfigDict
+
+
+class Settings(BaseSettings):
+    app_title: str
+    database_url: str
+    test_database_url: str
+    redis_url: str = "redis://redis:6379/0"
+
+    db_host: str = Field(validation_alias="POSTGRES_HOST")
+    db_port: int = Field(validation_alias="POSTGRES_PORT")
+
+    model_config = SettingsConfigDict(
+        env_file=".env",
+        env_file_encoding="utf-8",
+        extra="ignore",
+        case_sensitive=False
+    )
+
+
+settings = Settings()
+
+```
+
+`app/core/context.py`:
+
+```py
+from contextvars import ContextVar
+
+request_id_ctx: ContextVar[str] = ContextVar('request_id')
+
+```
+
+`app/core/logging.py`:
+
+```py
+import logging
+import sys
+
+from app.core.context import request_id_ctx
+
+
+class RequestFilter(logging.Filter):
+    def filter(self, record):
+        try:
+            request_id = request_id_ctx.get()
+        except LookupError:
+            request_id = None
+        record.request_id = request_id or ""
+        return True
+
+
+def setup_logging():
+    logger = logging.getLogger("profiler")
+    if not logger.handlers:
+        stdout_handler = logging.StreamHandler(sys.stdout)
+        formatter = logging.Formatter('%(levelname)s:     %(message)s:     %(request_id)s')
+        stdout_handler.setFormatter(formatter)
+        stdout_handler.addFilter(RequestFilter())
+        logger.addHandler(stdout_handler)
+    logger.setLevel(logging.INFO)
+    logger.propagate = False
+
+```
+
+`app/core/middleware.py`:
+
+```py
+import logging
+import time
+import traceback
+import uuid
+
+from fastapi import FastAPI, Request, Response
+from fastapi.responses import JSONResponse
+from starlette.middleware.base import BaseHTTPMiddleware
+
+from app.core.context import request_id_ctx
+
+logger = logging.getLogger("profiler")
+
+
+class ProfilerAndExceptionMiddleware(BaseHTTPMiddleware):
+    async def dispatch(self, request: Request, call_next):
+        request_id = request.headers.get("x-request-id") or str(uuid.uuid4())
+
+        start_time = time.perf_counter()
+        token = request_id_ctx.set(request_id)
+        try:
+            response: Response = await call_next(request)
+
+        except Exception as exc:
+            stack_trace = traceback.format_exc()
+            logger.error(f"[UNEXPECTED ERROR] {exc}\n{stack_trace}")
+
+            response = JSONResponse(
+                status_code=500,
+                content={"detail": "Internal Server Error"}
+            )
+
+        finally:
+            try:
+                request_id_ctx.reset(token)
+            except Exception:
+                pass
+
+        process_time = (time.perf_counter() - start_time) * 1000
+        latency_str = f"{process_time:.2f}ms"
+
+        response.headers["X-Response-Time"] = latency_str
+        response.headers["X-Request-ID"] = request_id
+
+        logger.info(
+            f"[PROFILER] Method: {request.method} | "
+            f"Path: {request.url.path} | "
+            f"Status: {response.status_code} | "
+            f"Latency: {latency_str}"
+        )
+
+        return response
+
+
+def register_middlewares(app: FastAPI) -> None:
+    app.add_middleware(ProfilerAndExceptionMiddleware)
+
+```
+
+`app/database/base.py`:
+
+```py
+from sqlalchemy.orm import declarative_base
+
+Base = declarative_base()
+
+```
+
+`app/database/db.py`:
+
+```py
+from sqlalchemy import create_engine
+from sqlalchemy.orm import sessionmaker
+
+from app.config import settings
+
+engine = create_engine(settings.database_url)
+SessionLocal = sessionmaker(bind=engine)
+
+
+def get_db():
+    db = SessionLocal()
+    try:
+        yield db
+        db.commit()
+    except Exception:
+        db.rollback()
+        raise
+    finally:
+        db.close()
+
+```
+
+`app/database/models.py`:
+
+```py
+from pgvector.sqlalchemy import Vector
+from sqlalchemy import Column, Integer, String, Text, ForeignKey
+from sqlalchemy.orm import relationship
+
+from app.database.base import Base
+
+
+class Document(Base):
+    __tablename__ = "documents"
+
+    id = Column(Integer, primary_key=True, index=True)
+    title = Column(String, nullable=False)
+    content = Column(Text, nullable=False)
+
+    chunks = relationship(
+        "Chunk",
+        back_populates="document",
+        cascade="all, delete-orphan"
+    )
+
+
+class Chunk(Base):
+    __tablename__ = "chunks"
+
+    id = Column(Integer, primary_key=True, index=True)
+    content = Column(Text, nullable=False)
+    document_id = Column(Integer, ForeignKey("documents.id", ondelete="CASCADE"), nullable=False)
+
+    embedding = Column(Vector(384), nullable=False)
+
+    document = relationship("Document", back_populates="chunks")
+
+```
+
+`app/main.py`:
+
+```py
+from fastapi import FastAPI
+
+from app.api.documents import router as document_router
+from app.api.search import router as search_router
+from app.config import settings
+from app.core.logging import setup_logging
+from app.core.middleware import register_middlewares
+
+setup_logging()
+app = FastAPI(title=settings.app_title)
+
+app.include_router(document_router, prefix="/api/documents", tags=["Documents"])
+app.include_router(search_router, prefix="/api/search", tags=["Search"])
+
+register_middlewares(app)
+
+```
+
+`app/schemas.py`:
+
+```py
+from pydantic import BaseModel
+
+
+class DocumentCreate(BaseModel):
+    title: str
+    content: str
+
+
+class DocumentResponse(BaseModel):
+    id: int
+    title: str
+    chunk_count: int
+
+
+class SearchResult(BaseModel):
+    chunk_id: int
+    document_title: str
+    content: str
+    score: float
+
+
+class DocumentListOut(BaseModel):
+    id: int
+    title: str
+    chunk_count: int
+
+class DocumentDetail(DocumentResponse):
+    content: str
+```
+
+`app/services/chunking_service.py`:
+
+```py
+def chunk_text(text: str, chunk_size: int = 200, overlap: int = 50):
+    if overlap >= chunk_size:
+        raise ValueError("invalid overlap")
+    if chunk_size <= 0:
+        raise ValueError("invalid chunk size")
+    start = 0
+    chunks = []
+    while start < len(text):
+        end = start + chunk_size
+        chunk = text[start:end].strip()
+        if chunk:
+            chunks.append(chunk)
+        start += chunk_size - overlap
+    return chunks
+
+```
+
+`app/services/document_service.py`:
+
+```py
+from sqlalchemy.orm import Session
+
+
+def get_documents(
+        db: Session,
+        limit: int = 10,
+        offset: int = 0,
+):
+    return db.query(Document).offset(offset).limit(limit).all()
+
+
+def get_document_by_id(db: Session, document_id: int):
+    return db.query(Document).filter(Document.id == document_id).first()
+
+
+from sqlalchemy.orm import Session
+from app.database.models import Document
+
+
+def delete_document(db: Session, document_id: int) -> bool:
+    db_document = db.query(Document).filter(Document.id == document_id).first()
+    if not db_document:
+        return False
+
+    db.delete(db_document)
+    db.commit()
+    return True
+
+```
+
+`app/services/embedding_service.py`:
+
+```py
+import os
+
+from sentence_transformers import SentenceTransformer
+from starlette.concurrency import run_in_threadpool
+
+model = SentenceTransformer(
+    "sentence-transformers/all-MiniLM-L6-v2",
+    cache_folder=os.getenv("HF_HOME", "/app/.hf_cache")
+)
+
+
+def generate_embeddings_sync(texts: list[str]):
+    embeddings = model.encode(texts)
+    embeddings_list = embeddings.tolist()
+    return embeddings_list
+
+
+async def get_embeddings(texts: list[str]):
+    if not texts:
+        return []
+    embedding_list = await run_in_threadpool(generate_embeddings_sync, texts)
+    return embedding_list
+
+
+async def get_embedding(text: str):
+    if not text:
+        return []
+    result = await get_embeddings([text])
+    return result[0]
+
+```
+
+`docker-compose.test.yml`:
+
+```yml
+services:
+
+  test_db:
+    image: pgvector/pgvector:pg17
+    environment:
+      POSTGRES_USER: test_user
+      POSTGRES_PASSWORD: "test_password123!"
+      POSTGRES_DB: rag_api_test_db
+    tmpfs:
+      - /var/lib/postgresql/data:rw
+    healthcheck:
+      test: [ "CMD-SHELL", "pg_isready -U test_user -d rag_api_test_db" ]
+      interval: 2s
+      timeout: 2s
+      retries: 5
+
+  test-runner:
+    build:
+      context: .
+      target: builder
+    volumes:
+      - .:/app
+    env_file:
+      - .env
+    environment:
+      - DATABASE_URL=postgresql://test_user:test_password123!@test_db:5432/rag_api_test_db
+      - TEST_DATABASE_URL=postgresql://test_user:test_password123!@test_db:5432/rag_api_test_db
+      - DB_HOST=test_db
+      - DB_PORT=5432
+      - POSTGRES_HOST=test_db
+      - POSTGRES_USER=test_user
+      - POSTGRES_PASSWORD=test_password123!
+      - POSTGRES_DB=rag_api_test_db
+    depends_on:
+      test_db:
+        condition: service_healthy
+    command: sh -c "alembic upgrade head && pytest -v --tb=short"
+```
+
+`docker-compose.yml`:
+
+```yml
+services:
+  app:
+    build: .
+    env_file:
+      - .env
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: [ "CMD", "curl", "-f", "http://localhost:8000/docs" ]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+
+  db:
+    image: pgvector/pgvector:pg17
+    env_file:
+      - .env
+    volumes:
+      - db_data:/var/lib/postgresql/data
+    ports:
+      - "5434:5432"
+    healthcheck:
+      test: [ "CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB" ]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+      start_period: 60s
+    restart: unless-stopped
+
+  redis:
+    image: redis:8-alpine
+    container_name: rag_redis
+    ports:
+      - "6380:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: [ "CMD", "redis-cli", "ping" ]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    restart: unless-stopped
+
+  nginx:
+    image: nginx:alpine
+    ports:
+      - "8080:80"
+    volumes:
+      - ./nginx.conf:/etc/nginx/nginx.conf
+    depends_on:
+      app:
+        condition: service_healthy
+
+volumes:
+  db_data:
+  redis_data:
+```
+
+`entrypoint.sh`:
+
+```sh
+#!/bin/sh
+set -e
+alembic upgrade head
+exec "$@"
+```
+
+`nginx.conf`:
+
+```conf
+events {
+    worker_connections 1024;
+}
+
+http {
+    limit_req_zone $binary_remote_addr zone=api_limit:10m rate=5r/s;
+    limit_req_zone $binary_remote_addr zone=documents_limit:10m rate=10r/s;
+    limit_req_zone $binary_remote_addr zone=search_limit:10m rate=20r/s;
+
+    limit_req_status 429;
+
+    upstream backend {
+        server app:8000;
+    }
+
+    server {
+        listen 80;
+
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_set_header X-Request-ID $http_x_request_id;
+        proxy_buffering on;
+        proxy_request_buffering on;
+
+        location /api/documents {
+            limit_req zone=documents_limit burst=10 nodelay;
+            proxy_pass http://backend;
+        }
+
+        location /api/search {
+            limit_req zone=search_limit burst=15 nodelay;
+            proxy_pass http://backend;
+        }
+
+        location / {
+            limit_req zone=api_limit burst=5 nodelay;
+            proxy_pass http://backend;
+        }
+    }
+}
+```
+
+`requirements.txt`:
+
+```txt
+fastapi==0.136.3
+uvicorn==0.49.0
+gunicorn==26.0.0
+sqlalchemy==2.0.50
+alembic==1.18.4
+psycopg2-binary==2.9.12
+pydantic-settings==2.14.1
+redis==8.0.0
+sentence-transformers==5.5.1
+pgvector==0.4.2
+pytest==9.0.3
+fakeredis==2.36.1
+httpx2==2.4.0
+```
+
+`tests/test_api.py`:
+
+```py
+from fastapi.testclient import TestClient
+
+from app.main import app
+
+client = TestClient(app)
+
+from fastapi.testclient import TestClient
+from app.main import app
+
+client = TestClient(app)
+
+
+def test_post_document_returns_201_with_chunk_count():
+    payload = {"title": "Valid Title", "content": "Valid Content"}
+    response = client.post("/api/documents", json=payload)
+    assert response.status_code == 201
+    data = response.json()
+    assert "chunk_count" in data
+    assert isinstance(data["chunk_count"], int)
+    assert data["chunk_count"] > 0
+
+
+def test_search_returns_list_with_correct_structure():
+    client.post("/api/documents", json={
+        "title": "Search Test",
+        "content": "FastAPI is a modern web framework for building APIs"
+    })
+    response = client.get("/api/search", params={"q": "web framework"})
+    assert response.status_code == 200
+    data = response.json()
+    assert isinstance(data, list)
+    assert len(data) > 0
+    first = data[0]
+    assert "chunk_id" in first
+    assert "document_title" in first
+    assert "content" in first
+    assert "score" in first
+
+
+def test_get_documents_list_returns_200(client):
+    response = client.get("/api/documents", params={"limit": 5, "offset": 0})
+
+    assert response.status_code == 200
+
+    data = response.json()
+
+    assert isinstance(data, list)
+    assert len(data) <= 5
+
+    if len(data) > 0:
+        first_document = data[0]
+        assert "id" in first_document
+        assert "title" in first_document
+        assert "chunk_count" in first_document
+
+        assert isinstance(first_document["id"], int)
+        assert isinstance(first_document["title"], str)
+        assert isinstance(first_document["chunk_count"], int)
+
+
+def test_get_document_by_id_returns_200(client):
+    document_id = 21
+
+    response = client.get(f"/api/documents/{document_id}")
+
+    assert response.status_code == 200
+
+    data = response.json()
+
+    assert data["id"] == document_id
+    assert "title" in data
+    assert isinstance(data["title"], str)
+
+    assert "content" in data
+    assert isinstance(data["content"], str)
+    assert len(data["content"]) > 0
+
+
+def test_get_document_by_id_returns_404(client):
+    non_existent_id = 999999
+
+    response = client.get(f"/api/documents/{non_existent_id}")
+
+    assert response.status_code == 404
+
+    data = response.json()
+    assert "detail" in data
+    assert data["detail"] == "Document not found"
+
+
+def test_delete_document_returns_204(client):
+    document_id = 21
+
+    response = client.get_api_client().delete(
+        f"/api/documents/{document_id}")
+
+    assert response.status_code == 204
+
+    assert response.text == ""
+
+
+def test_delete_document_returns_404(client):
+    non_existent_id = 999999
+
+    response = client.delete(f"/api/documents/{non_existent_id}")
+
+    assert response.status_code == 404
+
+    data = response.json()
+    assert "detail" in data
+    assert data["detail"] == "Document not found"
+
+```
