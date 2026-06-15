@@ -28,4 +28,4 @@ alembic/__pycache__/
 alembic/versions/__pycache__/
 
 # Pytest
-.pytest_cache/
+.pytest_cache/project_context.txt
