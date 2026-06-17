@@ -11,7 +11,8 @@ rag-api
 │   ├── env.py
 │   ├── script.py.mako
 │   └── versions
-│       └── 2a5d7faae137_init_documents_and_chunks.py
+│       ├── 2a5d7faae137_init_documents_and_chunks.py
+│       └── ab8ab01e1746_add_hnsw_index_to_chunks_embedding.py
 ├── alembic.ini
 ├── app
 │   ├── __init__.py
@@ -32,19 +33,22 @@ rag-api
 │   │   └── models.py
 │   ├── main.py
 │   ├── schemas.py
-│   └── services
+│   ├── services
+│   │   ├── __init__.py
+│   │   ├── chunking_service.py
+│   │   ├── document_service.py
+│   │   └── embedding_service.py
+│   └── utils
 │       ├── __init__.py
-│       ├── chunking_service.py
-│       ├── document_service.py
-│       └── embedding_service.py
+│       └── scoring.py
 ├── docker-compose.test.yml
 ├── docker-compose.yml
 ├── entrypoint.sh
 ├── nginx.conf
-├── project_context.txt
 ├── requirements.txt
 └── tests
     ├── __init__.py
+    ├── populate_rag.py
     └── test_api.py
 
 ```
@@ -619,6 +623,42 @@ def downgrade() -> None:
 
 ```
 
+`alembic/versions/ab8ab01e1746_add_hnsw_index_to_chunks_embedding.py`:
+
+```py
+"""add_hnsw_index_to_chunks_embedding
+
+Revision ID: ab8ab01e1746
+Revises: 2a5d7faae137
+Create Date: 2026-06-17 10:51:15.654453
+
+"""
+from typing import Sequence, Union
+
+from alembic import op
+
+# revision identifiers, used by Alembic.
+revision: str = 'ab8ab01e1746'
+down_revision: Union[str, Sequence[str], None] = '2a5d7faae137'
+branch_labels: Union[str, Sequence[str], None] = None
+depends_on: Union[str, Sequence[str], None] = None
+
+
+def upgrade() -> None:
+    op.execute("""
+               CREATE INDEX idx_chunks_embedding_hnsw
+                   ON chunks
+                   USING hnsw (embedding vector_cosine_ops);
+               """)
+
+
+def downgrade() -> None:
+    op.execute("""
+               DROP INDEX IF EXISTS idx_chunks_embedding_hnsw;
+               """)
+
+```
+
 `app/api/documents.py`:
 
 ```py
@@ -630,7 +670,7 @@ from sqlalchemy.orm import Session
 
 from app.database.db import get_db
 from app.database.models import Document, Chunk
-from app.schemas import DocumentCreate, DocumentResponse, DocumentListOut, DocumentDetail
+from app.schemas import DocumentCreate, DocumentResponse, DocumentDetail
 from app.services.chunking_service import chunk_text
 from app.services.document_service import get_documents, get_document_by_id, delete_document
 from app.services.embedding_service import get_embeddings
@@ -658,7 +698,7 @@ async def create_document(payload: DocumentCreate, db: Session = Depends(get_db)
     }
 
 
-@router.get("", response_model=List[DocumentListOut])
+@router.get("", response_model=List[DocumentResponse])
 async def read_documents(
         limit: int = Query(default=10, ge=1, le=100),
         offset: int = Query(default=0, ge=0),
@@ -714,6 +754,7 @@ from app.database.db import get_db
 from app.database.models import Document, Chunk
 from app.schemas import SearchResult
 from app.services.embedding_service import get_embedding
+from app.utils.scoring import calculate_cosine_score
 
 router = APIRouter()
 
@@ -723,22 +764,23 @@ async def search(q: str, top_k: int = 5, db: Session = Depends(get_db)):
     vector = await get_embedding(q)
     distance = Chunk.embedding.cosine_distance(vector)
     results = (
-        db.query(Chunk, Document.title, distance.label("score"))
+        db.query(Chunk, Document.title, distance.label("distance"))
         .join(Document, Chunk.document_id == Document.id)
         .order_by(distance)
         .limit(top_k)
         .all()
     )
-    return [
+    search_results = [
         {
             "chunk_id": row.Chunk.id,
             "document_title": row.title,
             "content": row.Chunk.content,
-            "score": row.score
+            "score": calculate_cosine_score(row.distance)
         }
         for row in results
     ]
-
+    search_results.sort(key=lambda x: x["score"], reverse=True)
+    return search_results
 ```
 
 `app/config.py`:
@@ -842,7 +884,10 @@ class ProfilerAndExceptionMiddleware(BaseHTTPMiddleware):
 
             response = JSONResponse(
                 status_code=500,
-                content={"detail": "Internal Server Error"}
+                content={
+                    "detail": "Internal Server Error",
+                    "request_id": request_id,
+                }
             )
 
         finally:
@@ -946,13 +991,15 @@ class Chunk(Base):
 `app/main.py`:
 
 ```py
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
+from fastapi.responses import JSONResponse
 
 from app.api.documents import router as document_router
 from app.api.search import router as search_router
 from app.config import settings
+from app.core.context import request_id_ctx
 from app.core.logging import setup_logging
-from app.core.middleware import register_middlewares
+from app.core.middleware import register_middlewares, logger
 
 setup_logging()
 app = FastAPI(title=settings.app_title)
@@ -962,17 +1009,41 @@ app.include_router(search_router, prefix="/api/search", tags=["Search"])
 
 register_middlewares(app)
 
+
+@app.exception_handler(Exception)
+async def global_exception_handler(request: Request, exc: Exception) -> JSONResponse:
+    req_id = request_id_ctx.get("unknown")
+
+    logger.error(
+        f"Unhandled exception occurred during request {req_id}: {str(exc)}",
+        exc_info=True
+    )
+
+    return JSONResponse(
+        status_code=500,
+        content={
+            "detail": "Internal Server Error",
+            "request_id": req_id
+        }
+    )
 ```
 
 `app/schemas.py`:
 
 ```py
-from pydantic import BaseModel
+from pydantic import BaseModel, field_validator
 
 
 class DocumentCreate(BaseModel):
     title: str
     content: str
+
+    @field_validator("content")
+    @classmethod
+    def validate_content_not_empty(cls, v: str) -> str:
+        if not v or not v.strip():
+            raise ValueError("Content cannot be empty or contain only whitespaces")
+        return v
 
 
 class DocumentResponse(BaseModel):
@@ -988,13 +1059,9 @@ class SearchResult(BaseModel):
     score: float
 
 
-class DocumentListOut(BaseModel):
-    id: int
-    title: str
-    chunk_count: int
-
 class DocumentDetail(DocumentResponse):
     content: str
+
 ```
 
 `app/services/chunking_service.py`:
@@ -1082,6 +1149,14 @@ async def get_embedding(text: str):
         return []
     result = await get_embeddings([text])
     return result[0]
+
+```
+
+`app/utils/scoring.py`:
+
+```py
+def calculate_cosine_score(cosine_distance: float) -> float:
+    return 1.0 - cosine_distance
 
 ```
 
@@ -1265,16 +1340,74 @@ fakeredis==2.36.1
 httpx2==2.4.0
 ```
 
+`tests/populate_rag.py`:
+
+```py
+import asyncio
+from app.database.db import SessionLocal
+from app.database.models import Document, Chunk
+from app.services.chunking_service import chunk_text
+from app.services.embedding_service import get_embeddings
+
+DATASET = [
+    {
+        "title": "Culinary: Cooking authentic Ukrainian borscht",
+        "content": "For the perfect borscht you need high quality beef on the bone. The meat is cooked for about two hours on low heat, constantly removing the foam. Then sautéed beets with lemon juice, potatoes, fresh cabbage, and fried onions with carrots are added. At the very end, garlic mashed with old lard is put in, and it is left to infuse for 20 minutes."
+    },
+    {
+        "title": "Programming: Python language fundamentals and ecosystem",
+        "content": "The Python programming language gained popularity due to its concise syntax and powerful ecosystem of libraries. For working with databases, SQLAlchemy or Tortoise ORM are often used, and for creating high performance APIs, the FastAPI framework is preferred. In the field of artificial intelligence, PyTorch, TensorFlow, and Hugging Face libraries have become the standard."
+    },
+    {
+        "title": "Sports: Evolution of modern European football",
+        "content": "Modern football requires maximum physical conditioning and tactical flexibility from players. The high pressing tactic, popularized by German managers, forces teams to defend right in the opponent's half of the pitch. Ball control in the midfield and fast wing attacks involving full-backs play a crucial role."
+    },
+    {
+        "title": "History: The Renaissance era in Italian architecture",
+        "content": "The Renaissance brought back strict classical proportions, symmetry, and the order system to European architecture. Filippo Brunelleschi erected the monumental dome of the Santa Maria del Fiore cathedral in Florence, marking the beginning of a new era. Building spaces became centered, logical, and proportioned to human scale, unlike Gothic design."
+    }
+]
+
+
+async def main():
+    db = SessionLocal()
+    try:
+        for i in range(1, 51):
+            template = DATASET[(i - 1) % len(DATASET)]
+            title = f"{template['title']} (Instance #{i})"
+            content = f"Document ID-{i}. {template['content']} Additional unique search token: doc_token_{i}."
+
+            db_document = Document(title=title, content=content)
+            db.add(db_document)
+            db.flush()
+
+            chunked_payload = chunk_text(content)
+            vectors = await get_embeddings(chunked_payload)
+
+            chunks_to_insert = [
+                Chunk(content=c_content, document_id=db_document.id, embedding=vector)
+                for c_content, vector in zip(chunked_payload, vectors)
+            ]
+            db.add_all(chunks_to_insert)
+            db.commit()
+            print(f"Inserted document {i}/50 with {len(chunked_payload)} chunks.")
+    except Exception as e:
+        db.rollback()
+        print(f"Execution failed: {e}")
+    finally:
+        db.close()
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
+
+```
+
 `tests/test_api.py`:
 
 ```py
 from fastapi.testclient import TestClient
 
-from app.main import app
-
-client = TestClient(app)
-
-from fastapi.testclient import TestClient
 from app.main import app
 
 client = TestClient(app)
@@ -1300,84 +1433,133 @@ def test_search_returns_list_with_correct_structure():
     data = response.json()
     assert isinstance(data, list)
     assert len(data) > 0
-    first = data[0]
-    assert "chunk_id" in first
-    assert "document_title" in first
-    assert "content" in first
-    assert "score" in first
 
 
-def test_get_documents_list_returns_200(client):
+def test_get_documents_list_returns_200():
     response = client.get("/api/documents", params={"limit": 5, "offset": 0})
-
     assert response.status_code == 200
-
     data = response.json()
-
     assert isinstance(data, list)
-    assert len(data) <= 5
-
     if len(data) > 0:
         first_document = data[0]
         assert "id" in first_document
         assert "title" in first_document
         assert "chunk_count" in first_document
 
-        assert isinstance(first_document["id"], int)
-        assert isinstance(first_document["title"], str)
-        assert isinstance(first_document["chunk_count"], int)
 
+def test_get_document_by_id_returns_200():
+    create_resp = client.post("/api/documents", json={"title": "Temp", "content": "Some content here"})
+    doc_id = create_resp.json()["id"]
 
-def test_get_document_by_id_returns_200(client):
-    document_id = 21
-
-    response = client.get(f"/api/documents/{document_id}")
-
+    response = client.get(f"/api/documents/{doc_id}")
     assert response.status_code == 200
-
     data = response.json()
-
-    assert data["id"] == document_id
-    assert "title" in data
-    assert isinstance(data["title"], str)
-
-    assert "content" in data
-    assert isinstance(data["content"], str)
-    assert len(data["content"]) > 0
+    assert data["id"] == doc_id
+    assert data["content"] == "Some content here"
 
 
-def test_get_document_by_id_returns_404(client):
+def test_get_document_by_id_returns_404():
     non_existent_id = 999999
-
     response = client.get(f"/api/documents/{non_existent_id}")
-
     assert response.status_code == 404
-
-    data = response.json()
-    assert "detail" in data
-    assert data["detail"] == "Document not found"
+    assert response.json()["detail"] == "Document not found"
 
 
-def test_delete_document_returns_204(client):
-    document_id = 21
+def test_delete_document_returns_204():
+    create_resp = client.post("/api/documents", json={"title": "To Delete", "content": "Delete me"})
+    doc_id = create_resp.json()["id"]
 
-    response = client.get_api_client().delete(
-        f"/api/documents/{document_id}")
-
+    response = client.delete(f"/api/documents/{doc_id}")
     assert response.status_code == 204
 
-    assert response.text == ""
 
-
-def test_delete_document_returns_404(client):
+def test_delete_document_returns_404():
     non_existent_id = 999999
-
     response = client.delete(f"/api/documents/{non_existent_id}")
-
     assert response.status_code == 404
+    assert response.json()["detail"] == "Document not found"
+
+
+def test_search_scores_are_sorted_descending():
+    client.post(
+        "/api/documents",
+        json={
+            "title": "Python",
+            "content": (
+                "Python programming language. "
+                "FastAPI framework. SQLAlchemy ORM."
+            ),
+        },
+    )
+
+    response = client.get(
+        "/api/search",
+        params={"q": "FastAPI framework"}
+    )
+    assert response.status_code == 200
+    results = response.json()
+    assert len(results) > 0
+    assert results[0]["score"] > 0.5
+    scores = [item["score"] for item in results]
+    assert scores == sorted(scores, reverse=True)
+
+
+def test_create_document_empty_content_returns_422():
+    response = client.post(
+        "/api/documents",
+        json={
+            "title": "Test",
+            "content": "",
+        },
+    )
+    assert response.status_code == 422
+    assert (
+            "Content cannot be empty or contain only whitespaces"
+            in str(response.json())
+    )
+
+
+def test_create_document_whitespace_content_returns_422():
+    response = client.post(
+        "/api/documents",
+        json={
+            "title": "Test",
+            "content": "   ",
+        },
+    )
+
+    assert response.status_code == 422
+
+    assert (
+            "Content cannot be empty or contain only whitespaces"
+            in str(response.json())
+    )
+
+
+from unittest.mock import patch
+
+
+def test_exception_handler_returns_expected_format():
+    with patch(
+            "app.api.search.get_embedding",
+            side_effect=Exception("boom")
+    ):
+        response = client.get(
+            "/api/search",
+            params={"q": "test"}
+        )
+
+    assert response.status_code == 500
 
     data = response.json()
-    assert "detail" in data
-    assert data["detail"] == "Document not found"
+
+    assert data["detail"] == "Internal Server Error"
+
+    assert "request_id" in data
+    assert isinstance(data["request_id"], str)
+    assert len(data["request_id"]) > 0
+
+    assert "boom" not in str(data)
+    assert "traceback" not in str(data).lower()
 
 ```

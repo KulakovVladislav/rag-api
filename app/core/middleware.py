@@ -27,7 +27,10 @@ class ProfilerAndExceptionMiddleware(BaseHTTPMiddleware):
 
             response = JSONResponse(
                 status_code=500,
-                content={"detail": "Internal Server Error"}
+                content={
+                    "detail": "Internal Server Error",
+                    "request_id": request_id,
+                }
             )
 
         finally:

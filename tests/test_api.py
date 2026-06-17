@@ -70,3 +70,86 @@ def test_delete_document_returns_404():
     response = client.delete(f"/api/documents/{non_existent_id}")
     assert response.status_code == 404
     assert response.json()["detail"] == "Document not found"
+
+
+def test_search_scores_are_sorted_descending():
+    client.post(
+        "/api/documents",
+        json={
+            "title": "Python",
+            "content": (
+                "Python programming language. "
+                "FastAPI framework. SQLAlchemy ORM."
+            ),
+        },
+    )
+
+    response = client.get(
+        "/api/search",
+        params={"q": "FastAPI framework"}
+    )
+    assert response.status_code == 200
+    results = response.json()
+    assert len(results) > 0
+    assert results[0]["score"] > 0.5
+    scores = [item["score"] for item in results]
+    assert scores == sorted(scores, reverse=True)
+
+
+def test_create_document_empty_content_returns_422():
+    response = client.post(
+        "/api/documents",
+        json={
+            "title": "Test",
+            "content": "",
+        },
+    )
+    assert response.status_code == 422
+    assert (
+            "Content cannot be empty or contain only whitespaces"
+            in str(response.json())
+    )
+
+
+def test_create_document_whitespace_content_returns_422():
+    response = client.post(
+        "/api/documents",
+        json={
+            "title": "Test",
+            "content": "   ",
+        },
+    )
+
+    assert response.status_code == 422
+
+    assert (
+            "Content cannot be empty or contain only whitespaces"
+            in str(response.json())
+    )
+
+
+from unittest.mock import patch
+
+
+def test_exception_handler_returns_expected_format():
+    with patch(
+            "app.api.search.get_embedding",
+            side_effect=Exception("boom")
+    ):
+        response = client.get(
+            "/api/search",
+            params={"q": "test"}
+        )
+
+    assert response.status_code == 500
+
+    data = response.json()
+
+    assert data["detail"] == "Internal Server Error"
+
+    assert "request_id" in data
+    assert isinstance(data["request_id"], str)
+    assert len(data["request_id"]) > 0
+
+    assert "boom" not in str(data)
+    assert "traceback" not in str(data).lower()

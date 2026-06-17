@@ -6,7 +6,7 @@ from sqlalchemy.orm import Session
 
 from app.database.db import get_db
 from app.database.models import Document, Chunk
-from app.schemas import DocumentCreate, DocumentResponse, DocumentListOut, DocumentDetail
+from app.schemas import DocumentCreate, DocumentResponse, DocumentDetail
 from app.services.chunking_service import chunk_text
 from app.services.document_service import get_documents, get_document_by_id, delete_document
 from app.services.embedding_service import get_embeddings

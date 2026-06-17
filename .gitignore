@@ -19,7 +19,7 @@ venv/
 
 # Review artifacts
 review_output.txt
-
+project_context.txt
 # HuggingFace model cache
 .hf_cache/
 
