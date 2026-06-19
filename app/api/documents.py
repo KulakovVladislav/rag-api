@@ -1,36 +1,49 @@
+import logging
 from typing import List
 
-from fastapi import APIRouter, Depends, status, HTTPException, Response
+from fastapi import APIRouter, Depends, status, HTTPException, Response, BackgroundTasks
 from fastapi import Query
 from sqlalchemy.orm import Session
 
 from app.database.db import get_db
-from app.database.models import Document, Chunk
+from app.database.models import Document
 from app.schemas import DocumentCreate, DocumentResponse, DocumentDetail
-from app.services.chunking_service import chunk_text
-from app.services.document_service import get_documents, get_document_by_id, delete_document
-from app.services.embedding_service import get_embeddings
+from app.services.document_service import (
+    get_documents,
+    get_document_by_id,
+    delete_document,
+    process_document_background,
+)
 
 router = APIRouter()
+logger = logging.getLogger(__name__)
 
 
-@router.post("", status_code=status.HTTP_201_CREATED, response_model=DocumentResponse)
-async def create_document(payload: DocumentCreate, db: Session = Depends(get_db)):
-    db_document = Document(title=payload.title, content=payload.content)
+@router.post("", status_code=status.HTTP_202_ACCEPTED, response_model=DocumentResponse)
+async def create_document(
+        payload: DocumentCreate,
+        background_tasks: BackgroundTasks,
+        db: Session = Depends(get_db)
+):
+    db_document = Document(
+        title=payload.title,
+        content=payload.content,
+        status="processing"
+    )
     db.add(db_document)
-    db.flush()
-    chunked_payload = chunk_text(payload.content)
-    vectors = await get_embeddings(chunked_payload)
-    chunks_to_insert = [
-        Chunk(content=c_content, document_id=db_document.id, embedding=vector)
-        for c_content, vector in zip(chunked_payload, vectors)
-    ]
-    db.add_all(chunks_to_insert)
     db.commit()
+
+    background_tasks.add_task(
+        process_document_background,
+        document_id=db_document.id,
+        content=payload.content
+    )
+
     return {
         "id": db_document.id,
         "title": db_document.title,
-        "chunk_count": len(chunked_payload)
+        "status": "processing",
+        "chunk_count": 0
     }
 
 
@@ -45,7 +58,8 @@ async def read_documents(
         {
             "id": doc.id,
             "title": doc.title,
-            "chunk_count": len(doc.chunks)
+            "status": doc.status,
+            "chunk_count": len(doc.chunks) if doc.chunks else 0
         }
         for doc in documents
     ]
@@ -63,8 +77,9 @@ async def read_document(id: int, db: Session = Depends(get_db)):
     return {
         "id": db_document.id,
         "title": db_document.title,
-        "chunk_count": len(db_document.chunks),
-        "content": db_document.content
+        "content": db_document.content,
+        "status": db_document.status,
+        "chunk_count": len(db_document.chunks) if db_document.chunks else 0
     }
 
 

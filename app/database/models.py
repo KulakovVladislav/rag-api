@@ -11,6 +11,7 @@ class Document(Base):
     id = Column(Integer, primary_key=True, index=True)
     title = Column(String, nullable=False)
     content = Column(Text, nullable=False)
+    status = Column(String(20), server_default='completed', default='processing')
 
     chunks = relationship(
         "Chunk",

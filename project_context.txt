@@ -12,6 +12,7 @@ rag-api
 │   ├── script.py.mako
 │   └── versions
 │       ├── 2a5d7faae137_init_documents_and_chunks.py
+│       ├── 7c10ca9aec9a_add_status_to_documents.py
 │       └── ab8ab01e1746_add_hnsw_index_to_chunks_embedding.py
 ├── alembic.ini
 ├── app
@@ -33,14 +34,12 @@ rag-api
 │   │   └── models.py
 │   ├── main.py
 │   ├── schemas.py
-│   ├── services
-│   │   ├── __init__.py
-│   │   ├── chunking_service.py
-│   │   ├── document_service.py
-│   │   └── embedding_service.py
-│   └── utils
+│   └── services
 │       ├── __init__.py
-│       └── scoring.py
+│       ├── chunking_service.py
+│       ├── document_service.py
+│       ├── embedding_service.py
+│       └── search_service.py
 ├── docker-compose.test.yml
 ├── docker-compose.yml
 ├── entrypoint.sh
@@ -485,9 +484,15 @@ from logging.config import fileConfig
 from alembic import context
 from sqlalchemy import engine_from_config, pool
 
+
+
+
 from app.database.base import Base
+from app.database.models import Document, Chunk
+
 
 config = context.config
+target_metadata = Document.metadata
 
 if config.config_file_name is not None:
     fileConfig(config.config_file_name)
@@ -623,6 +628,40 @@ def downgrade() -> None:
 
 ```
 
+`alembic/versions/7c10ca9aec9a_add_status_to_documents.py`:
+
+```py
+"""add_status_to_documents
+
+Revision ID: 7c10ca9aec9a
+Revises: ab8ab01e1746
+Create Date: 2026-06-19 12:39:14.511676
+
+"""
+from typing import Sequence, Union
+
+import sqlalchemy as sa
+from alembic import op
+
+# revision identifiers, used by Alembic.
+revision: str = '7c10ca9aec9a'
+down_revision: Union[str, Sequence[str], None] = 'ab8ab01e1746'
+branch_labels: Union[str, Sequence[str], None] = None
+depends_on: Union[str, Sequence[str], None] = None
+
+
+def upgrade() -> None:
+    op.add_column(
+        'documents',
+        sa.Column('status', sa.String(length=20), server_default='completed', nullable=False)
+    )
+
+
+def downgrade() -> None:
+    op.drop_column('documents', 'status')
+
+```
+
 `alembic/versions/ab8ab01e1746_add_hnsw_index_to_chunks_embedding.py`:
 
 ```py
@@ -662,11 +701,14 @@ def downgrade() -> None:
 `app/api/documents.py`:
 
 ```py
+import asyncio
+import logging
 from typing import List
 
-from fastapi import APIRouter, Depends, status, HTTPException, Response
+from fastapi import APIRouter, Depends, status, HTTPException, Response, BackgroundTasks
 from fastapi import Query
 from sqlalchemy.orm import Session
+from contextlib import closing
 
 from app.database.db import get_db
 from app.database.models import Document, Chunk
@@ -676,25 +718,56 @@ from app.services.document_service import get_documents, get_document_by_id, del
 from app.services.embedding_service import get_embeddings
 
 router = APIRouter()
+logger = logging.getLogger(__name__)
 
 
-@router.post("", status_code=status.HTTP_201_CREATED, response_model=DocumentResponse)
-async def create_document(payload: DocumentCreate, db: Session = Depends(get_db)):
-    db_document = Document(title=payload.title, content=payload.content)
+async def process_document_background(document_id: int, content: str):
+    with closing(next(get_db())) as db:
+        try:
+            chunked_payload = chunk_text(content)
+            vectors = await (get_embeddings(chunked_payload))
+
+            chunks_to_insert = [
+                Chunk(content=c_content, document_id=document_id, embedding=vector)
+                for c_content, vector in zip(chunked_payload, vectors)
+            ]
+            db.add_all(chunks_to_insert)
+
+            db.query(Document).filter(Document.id == document_id).update({"status": "completed"})
+            db.commit()
+
+        except Exception as e:
+            logger.error(f"Error processing document {document_id}: {e}", exc_info=True)
+            db.rollback()
+            db.query(Document).filter(Document.id == document_id).update({"status": "failed"})
+            db.commit()
+
+
+@router.post("", status_code=status.HTTP_202_ACCEPTED, response_model=DocumentResponse)
+async def create_document(
+        payload: DocumentCreate,
+        background_tasks: BackgroundTasks,
+        db: Session = Depends(get_db)
+):
+    db_document = Document(
+        title=payload.title,
+        content=payload.content,
+        status="processing"
+    )
     db.add(db_document)
-    db.flush()
-    chunked_payload = chunk_text(payload.content)
-    vectors = await get_embeddings(chunked_payload)
-    chunks_to_insert = [
-        Chunk(content=c_content, document_id=db_document.id, embedding=vector)
-        for c_content, vector in zip(chunked_payload, vectors)
-    ]
-    db.add_all(chunks_to_insert)
     db.commit()
+
+    background_tasks.add_task(
+        process_document_background,
+        document_id=db_document.id,
+        content=payload.content
+    )
+
     return {
         "id": db_document.id,
         "title": db_document.title,
-        "chunk_count": len(chunked_payload)
+        "status": "processing",
+        "chunk_count": 0
     }
 
 
@@ -709,7 +782,8 @@ async def read_documents(
         {
             "id": doc.id,
             "title": doc.title,
-            "chunk_count": len(doc.chunks)
+            "status": doc.status,
+            "chunk_count": len(doc.chunks) if doc.chunks else 0
         }
         for doc in documents
     ]
@@ -727,8 +801,9 @@ async def read_document(id: int, db: Session = Depends(get_db)):
     return {
         "id": db_document.id,
         "title": db_document.title,
-        "chunk_count": len(db_document.chunks),
-        "content": db_document.content
+        "content": db_document.content,
+        "status": db_document.status,
+        "chunk_count": len(db_document.chunks) if db_document.chunks else 0
     }
 
 
@@ -754,7 +829,7 @@ from app.database.db import get_db
 from app.database.models import Document, Chunk
 from app.schemas import SearchResult
 from app.services.embedding_service import get_embedding
-from app.utils.scoring import calculate_cosine_score
+from app.services.search_service import calculate_cosine_score
 
 router = APIRouter()
 
@@ -766,11 +841,12 @@ async def search(q: str, top_k: int = 5, db: Session = Depends(get_db)):
     results = (
         db.query(Chunk, Document.title, distance.label("distance"))
         .join(Document, Chunk.document_id == Document.id)
+        .filter(Document.status == "completed")
         .order_by(distance)
         .limit(top_k)
         .all()
     )
-    search_results = [
+    return [
         {
             "chunk_id": row.Chunk.id,
             "document_title": row.title,
@@ -779,8 +855,7 @@ async def search(q: str, top_k: int = 5, db: Session = Depends(get_db)):
         }
         for row in results
     ]
-    search_results.sort(key=lambda x: x["score"], reverse=True)
-    return search_results
+
 ```
 
 `app/config.py`:
@@ -967,6 +1042,7 @@ class Document(Base):
     id = Column(Integer, primary_key=True, index=True)
     title = Column(String, nullable=False)
     content = Column(Text, nullable=False)
+    status = Column(String(20), server_default='completed', default='processing')
 
     chunks = relationship(
         "Chunk",
@@ -1049,6 +1125,7 @@ class DocumentCreate(BaseModel):
 class DocumentResponse(BaseModel):
     id: int
     title: str
+    status: str
     chunk_count: int
 
 
@@ -1152,7 +1229,7 @@ async def get_embedding(text: str):
 
 ```
 
-`app/utils/scoring.py`:
+`app/services/search_service.py`:
 
 ```py
 def calculate_cosine_score(cosine_distance: float) -> float:

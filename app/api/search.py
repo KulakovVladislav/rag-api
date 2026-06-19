@@ -17,11 +17,12 @@ async def search(q: str, top_k: int = 5, db: Session = Depends(get_db)):
     results = (
         db.query(Chunk, Document.title, distance.label("distance"))
         .join(Document, Chunk.document_id == Document.id)
+        .filter(Document.status == "completed")
         .order_by(distance)
         .limit(top_k)
         .all()
     )
-    search_results = [
+    return [
         {
             "chunk_id": row.Chunk.id,
             "document_title": row.title,
@@ -30,5 +31,3 @@ async def search(q: str, top_k: int = 5, db: Session = Depends(get_db)):
         }
         for row in results
     ]
-    search_results.sort(key=lambda x: x["score"], reverse=True)
-    return search_results

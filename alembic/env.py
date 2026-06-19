@@ -8,8 +8,10 @@ from alembic import context
 from sqlalchemy import engine_from_config, pool
 
 from app.database.base import Base
+from app.database.models import Document
 
 config = context.config
+target_metadata = Document.metadata
 
 if config.config_file_name is not None:
     fileConfig(config.config_file_name)

@@ -16,6 +16,7 @@ class DocumentCreate(BaseModel):
 class DocumentResponse(BaseModel):
     id: int
     title: str
+    status: str
     chunk_count: int
 
 
