@@ -7,6 +7,7 @@ class Settings(BaseSettings):
     database_url: str
     test_database_url: str
     redis_url: str = "redis://redis:6379/0"
+    search_cache_ttl: int = 60
 
     db_host: str = Field(validation_alias="POSTGRES_HOST")
     db_port: int = Field(validation_alias="POSTGRES_PORT")

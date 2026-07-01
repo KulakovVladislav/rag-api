@@ -3,6 +3,7 @@ from contextlib import closing
 
 from sqlalchemy.orm import Session
 
+from app.core.redis import get_redis_client
 from app.database.db import get_db
 from app.database.models import Document, Chunk
 from app.services.chunking_service import chunk_text
@@ -33,6 +34,13 @@ def delete_document(db: Session, document_id: int) -> bool:
     return True
 
 
+def invalidate_search_cache():
+    redis_client = get_redis_client()
+    keys_to_delete = list(redis_client.scan_iter("search:query:*"))
+    if keys_to_delete:
+        redis_client.delete(*keys_to_delete)
+
+
 async def process_document_background(document_id: int, content: str):
     with closing(next(get_db())) as db:
         try:
@@ -47,6 +55,8 @@ async def process_document_background(document_id: int, content: str):
 
             db.query(Document).filter(Document.id == document_id).update({"status": "completed"})
             db.commit()
+
+            invalidate_search_cache()
 
         except Exception as e:
             logger.error(f"Error processing document {document_id}: {e}", exc_info=True)

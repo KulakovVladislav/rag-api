@@ -1,4 +1,4 @@
-from fastapi import FastAPI, Request
+from fastapi import FastAPI
 from fastapi.responses import JSONResponse
 
 from app.api.documents import router as document_router
@@ -18,7 +18,7 @@ register_middlewares(app)
 
 
 @app.exception_handler(Exception)
-async def global_exception_handler(request: Request, exc: Exception) -> JSONResponse:
+async def global_exception_handler(exc: Exception) -> JSONResponse:
     req_id = request_id_ctx.get("unknown")
 
     logger.error(

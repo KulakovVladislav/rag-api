@@ -1,4 +1,5 @@
-from unittest.mock import patch, AsyncMock
+from unittest.mock import AsyncMock
+from unittest.mock import patch
 
 from fastapi.testclient import TestClient
 
@@ -207,3 +208,67 @@ def test_exception_handler_returns_expected_format():
 
     assert "boom" not in str(data)
     assert "traceback" not in str(data).lower()
+
+
+def test_search_returns_cache_hit_on_repeated_query():
+    unique_phrase = "cache hit unique marker phrase alpha"
+    client.post(
+        "/api/documents",
+        json={"title": "Cache Hit Doc", "content": unique_phrase},
+    )
+
+    first_response = client.get("/api/search", params={"q": unique_phrase, "top_k": 3})
+    assert first_response.status_code == 200
+    assert first_response.headers["X-Cache"] == "MISS"
+
+    second_response = client.get("/api/search", params={"q": unique_phrase, "top_k": 3})
+    assert second_response.status_code == 200
+    assert second_response.headers["X-Cache"] == "HIT"
+    assert second_response.json() == first_response.json()
+
+
+def test_search_returns_cache_miss_on_new_query():
+    unique_phrase = "cache miss unique marker phrase beta never seen before"
+
+    response = client.get("/api/search", params={"q": unique_phrase, "top_k": 3})
+    assert response.status_code == 200
+    assert response.headers["X-Cache"] == "MISS"
+
+
+def test_search_cache_invalidated_after_document_completion():
+    unique_phrase = "invalidation unique marker phrase gamma"
+
+    first_response = client.get("/api/search", params={"q": unique_phrase, "top_k": 5})
+    assert first_response.status_code == 200
+    assert first_response.headers["X-Cache"] == "MISS"
+
+    cached_response = client.get("/api/search", params={"q": unique_phrase, "top_k": 5})
+    assert cached_response.headers["X-Cache"] == "HIT"
+
+    client.post(
+        "/api/documents",
+        json={"title": "Invalidation Doc", "content": unique_phrase},
+    )
+
+    after_completion_response = client.get("/api/search", params={"q": unique_phrase, "top_k": 5})
+    assert after_completion_response.status_code == 200
+    assert after_completion_response.headers["X-Cache"] == "MISS"
+
+    contents = [r["content"] for r in after_completion_response.json()]
+    assert any(unique_phrase in c for c in contents)
+
+
+def test_search_different_top_k_produces_different_cache_key():
+    unique_phrase = "top k unique marker phrase delta"
+    client.post(
+        "/api/documents",
+        json={"title": "Top K Doc", "content": unique_phrase},
+    )
+
+    response_top_k_three = client.get("/api/search", params={"q": unique_phrase, "top_k": 3})
+    assert response_top_k_three.status_code == 200
+    assert response_top_k_three.headers["X-Cache"] == "MISS"
+
+    response_top_k_five = client.get("/api/search", params={"q": unique_phrase, "top_k": 5})
+    assert response_top_k_five.status_code == 200
+    assert response_top_k_five.headers["X-Cache"] == "MISS"

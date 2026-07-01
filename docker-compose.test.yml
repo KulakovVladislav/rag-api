@@ -14,6 +14,14 @@ services:
       timeout: 2s
       retries: 5
 
+  test_redis:
+    image: redis:7-alpine
+    healthcheck:
+      test: [ "CMD", "redis-cli", "ping" ]
+      interval: 2s
+      timeout: 2s
+      retries: 5
+
   test-runner:
     build:
       context: .
@@ -31,7 +39,10 @@ services:
       - POSTGRES_USER=test_user
       - POSTGRES_PASSWORD=test_password123!
       - POSTGRES_DB=rag_api_test_db
+      - REDIS_URL=redis://test_redis:6379/0
     depends_on:
       test_db:
+        condition: service_healthy
+      test_redis:
         condition: service_healthy
     command: sh -c "alembic upgrade head && pytest -v --tb=short"

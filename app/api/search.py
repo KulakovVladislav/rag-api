@@ -1,6 +1,11 @@
-from fastapi import APIRouter, Depends
+import hashlib
+import json
+
+from fastapi import APIRouter, Depends, Response
 from sqlalchemy.orm import Session
 
+from app.config import settings
+from app.core.redis import get_redis_client
 from app.database.db import get_db
 from app.database.models import Document, Chunk
 from app.schemas import SearchResult
@@ -11,7 +16,24 @@ router = APIRouter()
 
 
 @router.get("", response_model=list[SearchResult])
-async def search(q: str, top_k: int = 5, db: Session = Depends(get_db)):
+async def search(
+        response: Response,
+        q: str,
+        top_k: int = 5,
+        db: Session = Depends(get_db)
+):
+    query_hash = hashlib.md5(f"{q.strip().lower()}:{top_k}".encode("utf-8")).hexdigest()
+    cache_key = f"search:query:{query_hash}"
+
+    redis_client = get_redis_client()
+
+    cached_data = redis_client.get(cache_key)
+    if cached_data:
+        response.headers["X-Cache"] = "HIT"
+        return json.loads(cached_data)
+
+    response.headers["X-Cache"] = "MISS"
+
     vector = await get_embedding(q)
     distance = Chunk.embedding.cosine_distance(vector)
     results = (
@@ -22,7 +44,8 @@ async def search(q: str, top_k: int = 5, db: Session = Depends(get_db)):
         .limit(top_k)
         .all()
     )
-    return [
+
+    formatted_results = [
         {
             "chunk_id": row.Chunk.id,
             "document_title": row.title,
@@ -31,3 +54,11 @@ async def search(q: str, top_k: int = 5, db: Session = Depends(get_db)):
         }
         for row in results
     ]
+
+    redis_client.setex(
+        cache_key,
+        settings.search_cache_ttl,
+        json.dumps(formatted_results, ensure_ascii=False)
+    )
+
+    return formatted_results
