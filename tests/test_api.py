@@ -1,5 +1,4 @@
-from unittest.mock import AsyncMock
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 from fastapi.testclient import TestClient
 
@@ -272,3 +271,101 @@ def test_search_different_top_k_produces_different_cache_key():
     response_top_k_five = client.get("/api/search", params={"q": unique_phrase, "top_k": 5})
     assert response_top_k_five.status_code == 200
     assert response_top_k_five.headers["X-Cache"] == "MISS"
+
+
+def test_create_duplicate_completed_document_returns_409():
+    content = "Unique content for duplicate check completed."
+
+    first_resp = client.post(
+        "/api/documents",
+        json={"title": "Original Completed", "content": content}
+    )
+    assert first_resp.status_code == 202
+    doc_id = first_resp.json()["id"]
+
+    detail = client.get(f"/api/documents/{doc_id}")
+    assert detail.status_code == 200
+    assert detail.json()["status"] == "completed"
+
+    duplicate_resp = client.post(
+        "/api/documents",
+        json={"title": "Duplicate Completed", "content": content}
+    )
+    assert duplicate_resp.status_code == 409
+    data = duplicate_resp.json()
+    assert data["detail"] == "Document with identical content already exists"
+    assert data["existing_document_id"] == doc_id
+
+
+def test_create_duplicate_processing_document_returns_409():
+    content = "Unique content for duplicate check processing."
+
+    with patch("app.api.documents.process_document_background", new_callable=AsyncMock):
+        first_resp = client.post(
+            "/api/documents",
+            json={"title": "Original Processing", "content": content}
+        )
+        assert first_resp.status_code == 202
+        doc_id = first_resp.json()["id"]
+
+        duplicate_resp = client.post(
+            "/api/documents",
+            json={"title": "Duplicate Processing", "content": content}
+        )
+        assert duplicate_resp.status_code == 409
+        data = duplicate_resp.json()
+        assert data["detail"] == "Document with identical content already exists"
+        assert data["existing_document_id"] == doc_id
+
+
+def test_different_content_creates_new_document_successfully():
+    resp_one = client.post(
+        "/api/documents",
+        json={"title": "Doc One", "content": "Content number one."}
+    )
+    resp_two = client.post(
+        "/api/documents",
+        json={"title": "Doc Two", "content": "Content number two."}
+    )
+
+    assert resp_one.status_code == 202
+    assert resp_two.status_code == 202
+    assert resp_one.json()["id"] != resp_two.json()["id"]
+
+
+def test_document_fields_and_latency_lifecycle():
+    content = "Lifecycle test content for hashes and latencies."
+
+    with patch("app.api.documents.process_document_background", new_callable=AsyncMock):
+        create_resp = client.post(
+            "/api/documents",
+            json={"title": "Lifecycle Doc", "content": content}
+        )
+        doc_id = create_resp.json()["id"]
+
+        processing_detail = client.get(f"/api/documents/{doc_id}").json()
+
+        assert processing_detail.get("chunking_time_ms") is None
+        assert processing_detail.get("embedding_time_ms") is None
+        assert processing_detail.get("total_processing_time_ms") is None
+
+    completed_resp = client.post(
+        "/api/documents",
+        json={"title": "Lifecycle Doc Actual", "content": "Completely new distinct text to process."}
+    )
+    comp_doc_id = completed_resp.json()["id"]
+
+    completed_detail = client.get(f"/api/documents/{comp_doc_id}").json()
+    assert completed_detail["status"] == "completed"
+
+    assert completed_detail["chunking_time_ms"] is not None
+    assert completed_detail["chunking_time_ms"] > 0
+
+    assert completed_detail["embedding_time_ms"] is not None
+    assert completed_detail["embedding_time_ms"] > 0
+
+    assert completed_detail["total_processing_time_ms"] is not None
+    assert completed_detail["total_processing_time_ms"] > 0
+
+    expected_total = completed_detail["chunking_time_ms"] + completed_detail["embedding_time_ms"]
+    assert completed_detail["total_processing_time_ms"] == expected_total

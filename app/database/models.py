@@ -1,5 +1,5 @@
 from pgvector.sqlalchemy import Vector
-from sqlalchemy import Column, Integer, String, Text, ForeignKey
+from sqlalchemy import Column, Integer, String, Text, ForeignKey, Float
 from sqlalchemy.orm import relationship
 
 from app.database.base import Base
@@ -12,6 +12,10 @@ class Document(Base):
     title = Column(String, nullable=False)
     content = Column(Text, nullable=False)
     status = Column(String(20), server_default='completed', default='processing')
+    content_hash = Column(String(64), nullable=False)
+    chunking_time_ms = Column(Float, nullable=True)
+    embedding_time_ms = Column(Float, nullable=True)
+    total_processing_time_ms = Column(Float, nullable=True)
 
     chunks = relationship(
         "Chunk",

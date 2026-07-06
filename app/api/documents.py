@@ -13,6 +13,8 @@ from app.services.document_service import (
     get_document_by_id,
     delete_document,
     process_document_background,
+    hash_content,
+    get_document_by_hash
 )
 
 router = APIRouter()
@@ -25,18 +27,35 @@ async def create_document(
         background_tasks: BackgroundTasks,
         db: Session = Depends(get_db)
 ):
+    cleaned_content = payload.content.strip()
+    file_hash = hash_content(cleaned_content)
+
+    existing_doc = get_document_by_hash(db, file_hash)
+    if existing_doc:
+        from fastapi.responses import JSONResponse
+
+        return JSONResponse(
+            status_code=409,
+            content={
+                "detail": "Document with identical content already exists",
+                "existing_document_id": existing_doc.id
+            }
+        )
+
     db_document = Document(
         title=payload.title,
-        content=payload.content,
+        content=cleaned_content,
+        content_hash=file_hash,
         status="processing"
     )
     db.add(db_document)
     db.commit()
+    db.refresh(db_document)
 
     background_tasks.add_task(
         process_document_background,
         document_id=db_document.id,
-        content=payload.content
+        content=cleaned_content
     )
 
     return {
@@ -79,7 +98,10 @@ async def read_document(id: int, db: Session = Depends(get_db)):
         "title": db_document.title,
         "content": db_document.content,
         "status": db_document.status,
-        "chunk_count": len(db_document.chunks) if db_document.chunks else 0
+        "chunk_count": len(db_document.chunks) if db_document.chunks else 0,
+        "chunking_time_ms": db_document.chunking_time_ms,
+        "embedding_time_ms": db_document.embedding_time_ms,
+        "total_processing_time_ms": db_document.total_processing_time_ms
     }
 
 

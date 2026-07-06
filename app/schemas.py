@@ -1,3 +1,5 @@
+from typing import Optional
+
 from pydantic import BaseModel, field_validator
 
 
@@ -29,3 +31,6 @@ class SearchResult(BaseModel):
 
 class DocumentDetail(DocumentResponse):
     content: str
+    chunking_time_ms: Optional[float] = None
+    embedding_time_ms: Optional[float] = None
+    total_processing_time_ms: Optional[float] = None

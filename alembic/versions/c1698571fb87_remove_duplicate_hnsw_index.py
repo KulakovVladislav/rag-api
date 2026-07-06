@@ -17,12 +17,10 @@ depends_on: Union[str, Sequence[str], None] = None
 
 
 def upgrade() -> None:
-    """Upgrade schema."""
     op.drop_index('idx_chunks_embedding_hnsw', table_name='chunks')
 
 
 def downgrade() -> None:
-    """Downgrade schema."""
     op.create_index(
         'idx_chunks_embedding_hnsw',
         'chunks',

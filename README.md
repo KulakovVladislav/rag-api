@@ -17,13 +17,15 @@ in the background, so a 50-page document no longer ties up a Gunicorn worker for
 - [Architecture](#architecture)
 - [Async Document Processing](#async-document-processing)
 - [Project Structure](#project-structure)
+- [Content Deduplication](#content-deduplication)
+- [Search Result Caching](#search-result-caching)
+- [Observability](#observability)
 - [Getting Started](#getting-started)
 - [API Reference](#api-reference)
 - [Running Tests](#running-tests)
 - [Environment Variables](#environment-variables)
 - [Engineering Decisions](#engineering-decisions)
 - [Ticket Status](#ticket-status)
-- [CS Answers](./CS_ANSWERS.md)
 
 ---
 
@@ -33,7 +35,10 @@ RAG API implements the core pipeline of a document question-answering system:
 
 - Documents are accepted instantly, then chunked and embedded **in the background**
 - Document status (`processing` / `completed` / `failed`) tracks ingestion progress
+- Duplicate content is rejected at ingestion time via a SHA-256 content hash — no wasted embedding work
 - Semantic search finds the most relevant chunks via cosine similarity, and only ever searches `completed` documents
+- Search results are cached in Redis and automatically invalidated as soon as new content finishes processing
+- Every request is tagged with a request ID and timed, for request-level tracing in the logs
 - Everything runs locally — embeddings are generated with `sentence-transformers` (`all-MiniLM-L6-v2`)
 
 ---
@@ -130,31 +135,92 @@ that failed halfway through.
 
 ---
 
+## Content Deduplication
+
+Before scheduling any background work, `POST /api/documents` computes a SHA-256 hash of the trimmed content and
+checks it against `documents.content_hash`. If a document with identical content already exists — regardless of
+its current `status` — the request is rejected instead of re-chunking and re-embedding the same text.
+
+```
+POST /api/documents  (content already ingested)
+  → 409 Conflict
+  {
+    "detail": "Document with identical content already exists",
+    "existing_document_id": 7
+  }
+```
+
+This makes retried/duplicated client uploads (double-submits, retried background jobs, re-imported files) free
+instead of silently doubling storage and embedding cost. The check is on exact content, not fuzzy/semantic
+similarity — two documents with the same meaning but different wording are treated as distinct.
+
+---
+
+## Search Result Caching
+
+`GET /api/search` is backed by Redis. The cache key is an MD5 hash of the normalized query (`lowercased`,
+`stripped`) plus `top_k`, so identical searches — even across different clients — hit the same cache entry.
+
+- **Cache hit** → response served straight from Redis, `X-Cache: HIT` header, no embedding call, no DB query.
+- **Cache miss** → query is embedded, pgvector search runs, result is cached with a TTL (`search_cache_ttl`,
+  default `60s`), `X-Cache: MISS` header.
+- **Invalidation** — every time a document finishes background processing (`status="completed"`), all
+  `search:query:*` keys are flushed, so a newly-ingested document is searchable immediately rather than waiting
+  out the TTL of a stale cached result set.
+
+This trades a small amount of staleness (bounded by the TTL, and actively cleared on new content) for
+avoiding repeated embedding-model inference on hot queries.
+
+---
+
+## Observability
+
+Every request is wrapped by `ProfilerAndExceptionMiddleware`:
+
+- A `request_id` is read from the incoming `X-Request-ID` header, or generated (`uuid4`) if absent, and stored in
+  a `ContextVar` for the duration of the request — so it's available to any logger call downstream without
+  threading it through every function signature.
+- The response carries back `X-Request-ID` and `X-Response-Time` (milliseconds) headers.
+- Every request is logged as a single structured line: method, path, status code, and latency, tagged with the
+  `request_id`.
+- Unhandled exceptions are caught at two levels — the middleware (logs the stack trace, returns a `500` with the
+  `request_id`) and a global FastAPI `@app.exception_handler(Exception)` in `main.py` as a second safety net — so
+  a client always gets `{"detail": "Internal Server Error", "request_id": "..."}` instead of a raw traceback,
+  and the `request_id` in the response lets you grep the exact log line for that failure.
+
+---
+
 ## Project Structure
 
 ```
 rag-api/
 ├── app/
 │   ├── api/
-│   │   ├── documents.py          # POST/GET/DELETE /api/documents, background task trigger
-│   │   └── search.py             # GET /api/search (filters status="completed")
+│   │   ├── documents.py          # POST/GET/DELETE /api/documents, background task trigger, dedup check
+│   │   └── search.py             # GET /api/search (Redis cache, filters status="completed")
+│   ├── core/
+│   │   ├── context.py            # ContextVar carrying the current request_id
+│   │   ├── middleware.py         # Request timing + request-id tagging + fallback error handling
+│   │   ├── logging.py            # "profiler" logger config, injects request_id into log lines
+│   │   └── redis.py              # Cached Redis client factory
 │   ├── database/
-│   │   ├── models.py             # Document (with status), Chunk SQLAlchemy models
+│   │   ├── models.py             # Document (status, content_hash, timing metrics), Chunk models
 │   │   ├── db.py                 # Session management
 │   │   └── base.py               # Declarative base
 │   ├── services/
-│   │   ├── document_service.py   # get_documents / get_document_by_id / delete_document
-│   │   ├── embedding_service.py  # sentence-transformers wrapper
-│   │   └── chunking_service.py   # Text chunking logic
-│   ├── config.py                 # Pydantic settings
-│   └── main.py                   # FastAPI app, router registration
-├── alembic/                      # Database migrations (incl. status column)
-├── tests/                        # Pytest test suite
-├── docker-compose.yml            # Production stack
+│   │   ├── document_service.py   # CRUD, hash_content/get_document_by_hash, background processing, cache invalidation
+│   │   ├── embedding_service.py  # sentence-transformers wrapper (runs off the event loop via threadpool)
+│   │   ├── chunking_service.py   # Fixed-size overlapping text chunking
+│   │   └── search_service.py     # Cosine distance → similarity score conversion
+│   ├── schemas.py                 # Pydantic request/response models
+│   ├── config.py                 # Pydantic settings (DB, Redis, cache TTL)
+│   └── main.py                   # FastAPI app, router registration, global exception handler
+├── alembic/                      # Database migrations (status, HNSW index, content_hash + metrics)
+├── tests/                        # Pytest test suite (22 tests)
+├── docker-compose.yml            # Production stack (app + Postgres/pgvector + Redis + Nginx)
 ├── docker-compose.test.yml       # Isolated test stack
 ├── Dockerfile                    # Multi-stage, non-root
-├── nginx.conf                    # Rate limiting, proxy config
-└── CS_ANSWERS.md                 # Written answers to ticket's CS questions
+└── nginx.conf                    # Rate limiting (per-route), proxy config
 ```
 
 > `process_document_background()` lives in `app/services/document_service.py`; `app/api/documents.py` only wires
@@ -205,6 +271,18 @@ wait for embedding to finish.
 }
 ```
 
+**Response `409 Conflict`** — content already ingested (matched by SHA-256 hash, see
+[Content Deduplication](#content-deduplication))
+
+```json
+{
+  "detail": "Document with identical content already exists",
+  "existing_document_id": 7
+}
+```
+
+**Response `422 Unprocessable Entity`** — empty or whitespace-only `content`
+
 ---
 
 ### `GET /api/documents/{id}`
@@ -219,11 +297,16 @@ Returns the current state of a document, including ingestion status.
   "title": "FastAPI Guide",
   "content": "FastAPI is a modern...",
   "status": "completed",
-  "chunk_count": 4
+  "chunk_count": 4,
+  "chunking_time_ms": 2.31,
+  "embedding_time_ms": 148.92,
+  "total_processing_time_ms": 151.23
 }
 ```
 
-`status` is one of `processing`, `completed`, `failed`. While `processing`, `chunk_count` is `0`.
+`status` is one of `processing`, `completed`, `failed`. While `processing`, `chunk_count` is `0` and the
+`*_time_ms` fields are `null` — they're populated once background processing finishes, giving per-document
+visibility into how much of the pipeline's latency was chunking vs. embedding.
 
 ---
 
@@ -240,7 +323,9 @@ Lists documents with pagination. Each item includes `status` and `chunk_count`.
 
 ### `GET /api/search`
 
-Semantic search over stored chunks. Only searches chunks belonging to `completed` documents.
+Semantic search over stored chunks. Only searches chunks belonging to `completed` documents. Results are cached
+in Redis (see [Search Result Caching](#search-result-caching)); the response carries an `X-Cache: HIT|MISS`
+header.
 
 **Query parameters**
 
@@ -280,16 +365,29 @@ Tests run against an isolated PostgreSQL container with `tmpfs` — no persisten
 docker compose -f docker-compose.test.yml up --build --abort-on-container-exit
 ```
 
-14 tests cover the full async flow: immediate `202`/`processing` response, `completed` status with correct
-`chunk_count` once background processing finishes, a mocked-failure path that lands on `status="failed"`, and
-search excluding chunks from non-`completed` documents — alongside the original CRUD/validation/error-handling
-tests.
+22 tests cover:
+
+- **Async lifecycle** — immediate `202`/`processing` response, `completed` status with correct `chunk_count` and
+  populated `*_time_ms` fields once background processing finishes, a mocked-failure path landing on
+  `status="failed"`, and search excluding chunks from non-`completed` documents.
+- **Deduplication** — duplicate content against a `completed` document returns `409`, duplicate content against a
+  still-`processing` document also returns `409`, and genuinely different content is always accepted.
+- **Search caching** — repeated identical queries return a cache hit, a new query is a cache miss, different
+  `top_k` values produce different cache keys, and the cache is invalidated once a document finishes processing.
+- **CRUD / validation / error handling** — listing, fetching, deleting documents (incl. `404`s), empty/whitespace
+  content rejection (`422`), score ordering, and the global exception handler's response shape.
 
 ---
 
 ## Environment Variables
 
-See `.env.example` for all required variables with descriptions.
+See `.env.example` for all required variables. The most relevant ones beyond standard Postgres/app settings:
+
+| Variable                             | Used by                              | Default                | Notes                                                                                                                                                                                                                                                  |
+|--------------------------------------|--------------------------------------|------------------------|--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| `REDIS_URL`                          | `app/config.py` → `redis_url`        | `redis://redis:6379/0` | Backs both search caching and cache invalidation.                                                                                                                                                                                                      |
+| `SEARCH_CACHE_TTL`                   | `app/config.py` → `search_cache_ttl` | `60` (seconds)         | ⚠️ `.env.example` currently defines this as `TASKS_CACHE_TTL`, which `Settings` does not read — the app silently falls back to the `60`s default regardless of that value. Rename it to `SEARCH_CACHE_TTL` in your `.env` if you need a different TTL. |
+| `DATABASE_URL` / `TEST_DATABASE_URL` | `app/config.py`                      | — (required)           | Full SQLAlchemy connection strings; `TEST_DATABASE_URL` is used by the isolated test stack.                                                                                                                                                            |
 
 ---
 
@@ -360,12 +458,24 @@ Tracking against `ТИКЕТ: Async Document Processing с фоновой обр
 | Migration default           | Explicit `server_default` for existing rows so old documents stay searchable                                                                                                                                                                                                                          | ✅      |
 | AC-7 (tests)                | 4 new tests added (`202`+`processing`, `completed`+`chunk_count` after processing, mocked failure → `failed`, search excludes `processing` chunks). Old `test_post_document_returns_201_with_chunk_count` rewritten to match the `202` contract. 14 tests total, all pre-existing behavior preserved. | ✅      |
 | Refactor checklist (Слой 5) | `process_document_background()` moved to `app/services/document_service.py`; `app/api/documents.py` now only imports and wires it into the route.                                                                                                                                                     | ✅      |
-| CS-фундамент (Слой 4)       | Written up in [`CS_ANSWERS.md`](./CS_ANSWERS.md): event loop blocking vs. Celery isolation, FSM vs. inferred state race condition, DB session lifecycle.                                                                                                                                              | ✅      |
+| CS-фундамент (Слой 4)       | Event loop blocking vs. Celery isolation, FSM vs. inferred state race condition, and DB session lifecycle are written up in [Engineering Decisions](#engineering-decisions) below.                                                                                                                    | ✅      |
 
 ### Out of scope (by request)
 
 Hard Mode (Слой 7: `GET /api/documents/{id}/status` with `Retry-After`, and the idempotency check for
 duplicate in-flight `POST`s) was intentionally left out of this pass.
+
+### Follow-up iteration (beyond the original ticket)
+
+Shipped after the initial async-processing ticket, in later commits:
+
+- Content deduplication via SHA-256 `content_hash`, with per-document `chunking_time_ms` / `embedding_time_ms` /
+  `total_processing_time_ms` metrics added in the same migration.
+- Redis-backed search result caching with `X-Cache` headers and completion-triggered invalidation.
+- Request-id tagging and per-request latency logging (`X-Request-ID`, `X-Response-Time`) via
+  `ProfilerAndExceptionMiddleware`.
+- Duplicate HNSW index removed (`ab8ab01e1746` had created it once; a later migration branch created a second
+  one, cleaned up via `c1698571fb87` + a merge migration).
 
 ### Smaller things worth a look
 
