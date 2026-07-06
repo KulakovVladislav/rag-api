@@ -3,6 +3,7 @@ from unittest.mock import AsyncMock, patch
 from fastapi.testclient import TestClient
 
 from app.main import app
+from app.services import document_service
 
 client = TestClient(app)
 
@@ -369,3 +370,69 @@ def test_document_fields_and_latency_lifecycle():
 
     expected_total = completed_detail["chunking_time_ms"] + completed_detail["embedding_time_ms"]
     assert completed_detail["total_processing_time_ms"] == expected_total
+
+
+def test_content_hash_unique_constraint_returns_409_on_race():
+    """
+    Simulates two near-simultaneous identical POSTs both passing the application-level
+    get_document_by_hash() pre-check (because neither has committed yet when the other
+    checks). get_document_by_hash is mocked to return None for the first two calls —
+    the pre-check on request 1 and the pre-check on request 2 — so both requests reach
+    db.commit(). The first commit succeeds and creates the row. The second commit hits
+    the real UNIQUE constraint on documents.content_hash (added in
+    add_unique_constraint_to_content_hash) and raises IntegrityError, which
+    create_document() catches, rolls back, and turns into a 409 — using a *real*
+    (unmocked) get_document_by_hash() call to resolve existing_document_id, which is why
+    the mock only forces None for the first two calls and falls through to the real
+    function afterwards.
+    """
+    content = "Race condition content for unique constraint test."
+
+    real_get_document_by_hash = document_service.get_document_by_hash
+    call_count = {"n": 0}
+
+    def fake_get_document_by_hash(db, content_hash):
+        call_count["n"] += 1
+        if call_count["n"] <= 2:
+            return None
+        return real_get_document_by_hash(db, content_hash)
+
+    with patch("app.api.documents.get_document_by_hash", side_effect=fake_get_document_by_hash):
+        first_resp = client.post(
+            "/api/documents",
+            json={"title": "Race First", "content": content}
+        )
+        assert first_resp.status_code == 202
+        doc_id = first_resp.json()["id"]
+
+        second_resp = client.post(
+            "/api/documents",
+            json={"title": "Race Second", "content": content}
+        )
+
+    assert call_count["n"] == 3
+    assert second_resp.status_code == 409
+    data = second_resp.json()
+    assert data["detail"] == "Document with identical content already exists"
+    assert data["existing_document_id"] == doc_id
+
+
+def test_content_hash_is_correctly_stored_after_creation():
+    content = "Content hash verification test content."
+
+    response = client.post(
+        "/api/documents",
+        json={"title": "Hash Check Doc", "content": content}
+    )
+    assert response.status_code == 202
+
+    expected_hash = document_service.hash_content(content)
+
+    from app.database.db import get_db
+    db = next(get_db())
+    try:
+        stored_doc = document_service.get_document_by_hash(db, expected_hash)
+        assert stored_doc is not None
+        assert stored_doc.content_hash == expected_hash
+    finally:
+        db.close()

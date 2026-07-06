@@ -3,6 +3,8 @@ from typing import List
 
 from fastapi import APIRouter, Depends, status, HTTPException, Response, BackgroundTasks
 from fastapi import Query
+from fastapi.responses import JSONResponse
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.database.db import get_db
@@ -32,8 +34,6 @@ async def create_document(
 
     existing_doc = get_document_by_hash(db, file_hash)
     if existing_doc:
-        from fastapi.responses import JSONResponse
-
         return JSONResponse(
             status_code=409,
             content={
@@ -49,7 +49,21 @@ async def create_document(
         status="processing"
     )
     db.add(db_document)
-    db.commit()
+
+    try:
+        db.commit()
+    except IntegrityError:
+
+        db.rollback()
+        existing_doc = get_document_by_hash(db, file_hash)
+        return JSONResponse(
+            status_code=409,
+            content={
+                "detail": "Document with identical content already exists",
+                "existing_document_id": existing_doc.id if existing_doc else None
+            }
+        )
+
     db.refresh(db_document)
 
     background_tasks.add_task(

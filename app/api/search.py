@@ -55,10 +55,10 @@ async def search(
         for row in results
     ]
 
-    redis_client.setex(
+    redis_client.set(
         cache_key,
-        settings.search_cache_ttl,
-        json.dumps(formatted_results, ensure_ascii=False)
+        json.dumps(formatted_results, ensure_ascii=False),
+        ex=settings.search_cache_ttl
     )
 
     return formatted_results
