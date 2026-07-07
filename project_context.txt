@@ -13,6 +13,8 @@ rag-api
 │   ├── script.py.mako
 │   └── versions
 │       ├── 2a5d7faae137_init_documents_and_chunks.py
+│       ├── 729150e3abb0_add_unique_constraint_to_content_hash.py
+│       ├── 7597efe1a8b5_add_content_hash_and_metrics_to_.py
 │       ├── 7c10ca9aec9a_add_status_to_documents.py
 │       ├── ab8ab01e1746_add_hnsw_index_to_chunks_embedding.py
 │       ├── c1698571fb87_remove_duplicate_hnsw_index.py
@@ -23,7 +25,8 @@ rag-api
 │   ├── api
 │   │   ├── __init__.py
 │   │   ├── documents.py
-│   │   └── search.py
+│   │   ├── search.py
+│   │   └── system.py
 │   ├── config.py
 │   ├── core
 │   │   ├── __init__.py
@@ -110,13 +113,15 @@ in the background, so a 50-page document no longer ties up a Gunicorn worker for
 - [Architecture](#architecture)
 - [Async Document Processing](#async-document-processing)
 - [Project Structure](#project-structure)
+- [Content Deduplication](#content-deduplication)
+- [Search Result Caching](#search-result-caching)
+- [Observability](#observability)
 - [Getting Started](#getting-started)
 - [API Reference](#api-reference)
 - [Running Tests](#running-tests)
 - [Environment Variables](#environment-variables)
 - [Engineering Decisions](#engineering-decisions)
 - [Ticket Status](#ticket-status)
-- [CS Answers](./CS_ANSWERS.md)
 
 ---
 
@@ -126,7 +131,10 @@ RAG API implements the core pipeline of a document question-answering system:
 
 - Documents are accepted instantly, then chunked and embedded **in the background**
 - Document status (`processing` / `completed` / `failed`) tracks ingestion progress
+- Duplicate content is rejected at ingestion time via a SHA-256 content hash — no wasted embedding work
 - Semantic search finds the most relevant chunks via cosine similarity, and only ever searches `completed` documents
+- Search results are cached in Redis and automatically invalidated as soon as new content finishes processing
+- Every request is tagged with a request ID and timed, for request-level tracing in the logs
 - Everything runs locally — embeddings are generated with `sentence-transformers` (`all-MiniLM-L6-v2`)
 
 ---
@@ -223,31 +231,92 @@ that failed halfway through.
 
 ---
 
+## Content Deduplication
+
+Before scheduling any background work, `POST /api/documents` computes a SHA-256 hash of the trimmed content and
+checks it against `documents.content_hash`. If a document with identical content already exists — regardless of
+its current `status` — the request is rejected instead of re-chunking and re-embedding the same text.
+
+```
+POST /api/documents  (content already ingested)
+  → 409 Conflict
+  {
+    "detail": "Document with identical content already exists",
+    "existing_document_id": 7
+  }
+```
+
+This makes retried/duplicated client uploads (double-submits, retried background jobs, re-imported files) free
+instead of silently doubling storage and embedding cost. The check is on exact content, not fuzzy/semantic
+similarity — two documents with the same meaning but different wording are treated as distinct.
+
+---
+
+## Search Result Caching
+
+`GET /api/search` is backed by Redis. The cache key is an MD5 hash of the normalized query (`lowercased`,
+`stripped`) plus `top_k`, so identical searches — even across different clients — hit the same cache entry.
+
+- **Cache hit** → response served straight from Redis, `X-Cache: HIT` header, no embedding call, no DB query.
+- **Cache miss** → query is embedded, pgvector search runs, result is cached with a TTL (`search_cache_ttl`,
+  default `60s`), `X-Cache: MISS` header.
+- **Invalidation** — every time a document finishes background processing (`status="completed"`), all
+  `search:query:*` keys are flushed, so a newly-ingested document is searchable immediately rather than waiting
+  out the TTL of a stale cached result set.
+
+This trades a small amount of staleness (bounded by the TTL, and actively cleared on new content) for
+avoiding repeated embedding-model inference on hot queries.
+
+---
+
+## Observability
+
+Every request is wrapped by `ProfilerAndExceptionMiddleware`:
+
+- A `request_id` is read from the incoming `X-Request-ID` header, or generated (`uuid4`) if absent, and stored in
+  a `ContextVar` for the duration of the request — so it's available to any logger call downstream without
+  threading it through every function signature.
+- The response carries back `X-Request-ID` and `X-Response-Time` (milliseconds) headers.
+- Every request is logged as a single structured line: method, path, status code, and latency, tagged with the
+  `request_id`.
+- Unhandled exceptions are caught at two levels — the middleware (logs the stack trace, returns a `500` with the
+  `request_id`) and a global FastAPI `@app.exception_handler(Exception)` in `main.py` as a second safety net — so
+  a client always gets `{"detail": "Internal Server Error", "request_id": "..."}` instead of a raw traceback,
+  and the `request_id` in the response lets you grep the exact log line for that failure.
+
+---
+
 ## Project Structure
 
 ```
 rag-api/
 ├── app/
 │   ├── api/
-│   │   ├── documents.py          # POST/GET/DELETE /api/documents, background task trigger
-│   │   └── search.py             # GET /api/search (filters status="completed")
+│   │   ├── documents.py          # POST/GET/DELETE /api/documents, background task trigger, dedup check
+│   │   └── search.py             # GET /api/search (Redis cache, filters status="completed")
+│   ├── core/
+│   │   ├── context.py            # ContextVar carrying the current request_id
+│   │   ├── middleware.py         # Request timing + request-id tagging + fallback error handling
+│   │   ├── logging.py            # "profiler" logger config, injects request_id into log lines
+│   │   └── redis.py              # Cached Redis client factory
 │   ├── database/
-│   │   ├── models.py             # Document (with status), Chunk SQLAlchemy models
+│   │   ├── models.py             # Document (status, content_hash, timing metrics), Chunk models
 │   │   ├── db.py                 # Session management
 │   │   └── base.py               # Declarative base
 │   ├── services/
-│   │   ├── document_service.py   # get_documents / get_document_by_id / delete_document
-│   │   ├── embedding_service.py  # sentence-transformers wrapper
-│   │   └── chunking_service.py   # Text chunking logic
-│   ├── config.py                 # Pydantic settings
-│   └── main.py                   # FastAPI app, router registration
-├── alembic/                      # Database migrations (incl. status column)
-├── tests/                        # Pytest test suite
-├── docker-compose.yml            # Production stack
+│   │   ├── document_service.py   # CRUD, hash_content/get_document_by_hash, background processing, cache invalidation
+│   │   ├── embedding_service.py  # sentence-transformers wrapper (runs off the event loop via threadpool)
+│   │   ├── chunking_service.py   # Fixed-size overlapping text chunking
+│   │   └── search_service.py     # Cosine distance → similarity score conversion
+│   ├── schemas.py                 # Pydantic request/response models
+│   ├── config.py                 # Pydantic settings (DB, Redis, cache TTL)
+│   └── main.py                   # FastAPI app, router registration, global exception handler
+├── alembic/                      # Database migrations (status, HNSW index, content_hash + metrics)
+├── tests/                        # Pytest test suite (22 tests)
+├── docker-compose.yml            # Production stack (app + Postgres/pgvector + Redis + Nginx)
 ├── docker-compose.test.yml       # Isolated test stack
 ├── Dockerfile                    # Multi-stage, non-root
-├── nginx.conf                    # Rate limiting, proxy config
-└── CS_ANSWERS.md                 # Written answers to ticket's CS questions
+└── nginx.conf                    # Rate limiting (per-route), proxy config
 ```
 
 > `process_document_background()` lives in `app/services/document_service.py`; `app/api/documents.py` only wires
@@ -298,6 +367,18 @@ wait for embedding to finish.
 }
 ```
 
+**Response `409 Conflict`** — content already ingested (matched by SHA-256 hash, see
+[Content Deduplication](#content-deduplication))
+
+```json
+{
+  "detail": "Document with identical content already exists",
+  "existing_document_id": 7
+}
+```
+
+**Response `422 Unprocessable Entity`** — empty or whitespace-only `content`
+
 ---
 
 ### `GET /api/documents/{id}`
@@ -312,11 +393,16 @@ Returns the current state of a document, including ingestion status.
   "title": "FastAPI Guide",
   "content": "FastAPI is a modern...",
   "status": "completed",
-  "chunk_count": 4
+  "chunk_count": 4,
+  "chunking_time_ms": 2.31,
+  "embedding_time_ms": 148.92,
+  "total_processing_time_ms": 151.23
 }
 ```
 
-`status` is one of `processing`, `completed`, `failed`. While `processing`, `chunk_count` is `0`.
+`status` is one of `processing`, `completed`, `failed`. While `processing`, `chunk_count` is `0` and the
+`*_time_ms` fields are `null` — they're populated once background processing finishes, giving per-document
+visibility into how much of the pipeline's latency was chunking vs. embedding.
 
 ---
 
@@ -333,7 +419,9 @@ Lists documents with pagination. Each item includes `status` and `chunk_count`.
 
 ### `GET /api/search`
 
-Semantic search over stored chunks. Only searches chunks belonging to `completed` documents.
+Semantic search over stored chunks. Only searches chunks belonging to `completed` documents. Results are cached
+in Redis (see [Search Result Caching](#search-result-caching)); the response carries an `X-Cache: HIT|MISS`
+header.
 
 **Query parameters**
 
@@ -373,16 +461,29 @@ Tests run against an isolated PostgreSQL container with `tmpfs` — no persisten
 docker compose -f docker-compose.test.yml up --build --abort-on-container-exit
 ```
 
-14 tests cover the full async flow: immediate `202`/`processing` response, `completed` status with correct
-`chunk_count` once background processing finishes, a mocked-failure path that lands on `status="failed"`, and
-search excluding chunks from non-`completed` documents — alongside the original CRUD/validation/error-handling
-tests.
+22 tests cover:
+
+- **Async lifecycle** — immediate `202`/`processing` response, `completed` status with correct `chunk_count` and
+  populated `*_time_ms` fields once background processing finishes, a mocked-failure path landing on
+  `status="failed"`, and search excluding chunks from non-`completed` documents.
+- **Deduplication** — duplicate content against a `completed` document returns `409`, duplicate content against a
+  still-`processing` document also returns `409`, and genuinely different content is always accepted.
+- **Search caching** — repeated identical queries return a cache hit, a new query is a cache miss, different
+  `top_k` values produce different cache keys, and the cache is invalidated once a document finishes processing.
+- **CRUD / validation / error handling** — listing, fetching, deleting documents (incl. `404`s), empty/whitespace
+  content rejection (`422`), score ordering, and the global exception handler's response shape.
 
 ---
 
 ## Environment Variables
 
-See `.env.example` for all required variables with descriptions.
+See `.env.example` for all required variables. The most relevant ones beyond standard Postgres/app settings:
+
+| Variable                             | Used by                              | Default                | Notes                                                                                                                                                                                                                                                  |
+|--------------------------------------|--------------------------------------|------------------------|--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| `REDIS_URL`                          | `app/config.py` → `redis_url`        | `redis://redis:6379/0` | Backs both search caching and cache invalidation.                                                                                                                                                                                                      |
+| `SEARCH_CACHE_TTL`                   | `app/config.py` → `search_cache_ttl` | `60` (seconds)         | ⚠️ `.env.example` currently defines this as `TASKS_CACHE_TTL`, which `Settings` does not read — the app silently falls back to the `60`s default regardless of that value. Rename it to `SEARCH_CACHE_TTL` in your `.env` if you need a different TTL. |
+| `DATABASE_URL` / `TEST_DATABASE_URL` | `app/config.py`                      | — (required)           | Full SQLAlchemy connection strings; `TEST_DATABASE_URL` is used by the isolated test stack.                                                                                                                                                            |
 
 ---
 
@@ -453,12 +554,24 @@ Tracking against `ТИКЕТ: Async Document Processing с фоновой обр
 | Migration default           | Explicit `server_default` for existing rows so old documents stay searchable                                                                                                                                                                                                                          | ✅      |
 | AC-7 (tests)                | 4 new tests added (`202`+`processing`, `completed`+`chunk_count` after processing, mocked failure → `failed`, search excludes `processing` chunks). Old `test_post_document_returns_201_with_chunk_count` rewritten to match the `202` contract. 14 tests total, all pre-existing behavior preserved. | ✅      |
 | Refactor checklist (Слой 5) | `process_document_background()` moved to `app/services/document_service.py`; `app/api/documents.py` now only imports and wires it into the route.                                                                                                                                                     | ✅      |
-| CS-фундамент (Слой 4)       | Written up in [`CS_ANSWERS.md`](./CS_ANSWERS.md): event loop blocking vs. Celery isolation, FSM vs. inferred state race condition, DB session lifecycle.                                                                                                                                              | ✅      |
+| CS-фундамент (Слой 4)       | Event loop blocking vs. Celery isolation, FSM vs. inferred state race condition, and DB session lifecycle are written up in [Engineering Decisions](#engineering-decisions) below.                                                                                                                    | ✅      |
 
 ### Out of scope (by request)
 
 Hard Mode (Слой 7: `GET /api/documents/{id}/status` with `Retry-After`, and the idempotency check for
 duplicate in-flight `POST`s) was intentionally left out of this pass.
+
+### Follow-up iteration (beyond the original ticket)
+
+Shipped after the initial async-processing ticket, in later commits:
+
+- Content deduplication via SHA-256 `content_hash`, with per-document `chunking_time_ms` / `embedding_time_ms` /
+  `total_processing_time_ms` metrics added in the same migration.
+- Redis-backed search result caching with `X-Cache` headers and completion-triggered invalidation.
+- Request-id tagging and per-request latency logging (`X-Request-ID`, `X-Response-Time`) via
+  `ProfilerAndExceptionMiddleware`.
+- Duplicate HNSW index removed (`ab8ab01e1746` had created it once; a later migration branch created a second
+  one, cleaned up via `c1698571fb87` + a merge migration).
 
 ### Smaller things worth a look
 
@@ -786,6 +899,105 @@ def downgrade() -> None:
 
 ```
 
+`alembic/versions/729150e3abb0_add_unique_constraint_to_content_hash.py`:
+
+```py
+"""add_unique_constraint_to_content_hash
+
+Revision ID: 729150e3abb0
+Revises: 7597efe1a8b5
+Create Date: 2026-07-06 17:48:52.143764
+
+"""
+from typing import Sequence, Union
+
+from alembic import op
+
+# revision identifiers, used by Alembic.
+revision: str = '729150e3abb0'
+down_revision: Union[str, Sequence[str], None] = '7597efe1a8b5'
+branch_labels: Union[str, Sequence[str], None] = None
+depends_on: Union[str, Sequence[str], None] = None
+
+
+def upgrade() -> None:
+    op.drop_index('idx_documents_content_hash', table_name='documents')
+    op.create_unique_constraint(
+        'uq_documents_content_hash',
+        'documents',
+        ['content_hash']
+    )
+
+
+def downgrade() -> None:
+    op.drop_constraint('uq_documents_content_hash', 'documents', type_='unique')
+    op.create_index('idx_documents_content_hash', 'documents', ['content_hash'])
+
+```
+
+`alembic/versions/7597efe1a8b5_add_content_hash_and_metrics_to_.py`:
+
+```py
+"""add_content_hash_and_metrics_to_documents
+
+Revision ID: 7597efe1a8b5
+Revises: ce5bffa2623f
+Create Date: 2026-07-06 11:29:28.378590
+
+"""
+import hashlib
+from typing import Sequence, Union
+
+import sqlalchemy as sa
+from alembic import op
+
+# revision identifiers, used by Alembic.
+revision: str = '7597efe1a8b5'
+down_revision: Union[str, Sequence[str], None] = 'ce5bffa2623f'
+branch_labels: Union[str, Sequence[str], None] = None
+depends_on: Union[str, Sequence[str], None] = None
+
+
+def upgrade() -> None:
+    op.add_column(
+        'documents',
+        sa.Column('content_hash', sa.String(64), nullable=True)
+    )
+    op.add_column(
+        'documents',
+        sa.Column('chunking_time_ms', sa.Float, nullable=True)
+    )
+    op.add_column(
+        'documents',
+        sa.Column('embedding_time_ms', sa.Float, nullable=True)
+    )
+    op.add_column(
+        'documents',
+        sa.Column('total_processing_time_ms', sa.Float, nullable=True)
+    )
+
+    connection = op.get_bind()
+    documents = connection.execute(sa.text("SELECT id, content FROM documents"))
+    for doc in documents:
+        hash_value = hashlib.sha256(doc.content.encode()).hexdigest()
+        connection.execute(
+            sa.text("UPDATE documents SET content_hash = :h WHERE id = :id"),
+            {"h": hash_value, "id": doc.id}
+        )
+
+    op.alter_column('documents', 'content_hash', nullable=False)
+    op.create_index('idx_documents_content_hash', 'documents', ['content_hash'])
+
+
+def downgrade() -> None:
+    op.drop_index('idx_documents_content_hash', 'documents')
+    op.drop_column('documents', 'content_hash')
+    op.drop_column('documents', 'chunking_time_ms')
+    op.drop_column('documents', 'embedding_time_ms')
+    op.drop_column('documents', 'total_processing_time_ms')
+
+```
+
 `alembic/versions/7c10ca9aec9a_add_status_to_documents.py`:
 
 ```py
@@ -878,12 +1090,10 @@ depends_on: Union[str, Sequence[str], None] = None
 
 
 def upgrade() -> None:
-    """Upgrade schema."""
     op.drop_index('idx_chunks_embedding_hnsw', table_name='chunks')
 
 
 def downgrade() -> None:
-    """Downgrade schema."""
     op.create_index(
         'idx_chunks_embedding_hnsw',
         'chunks',
@@ -914,12 +1124,10 @@ depends_on: Union[str, Sequence[str], None] = None
 
 
 def upgrade() -> None:
-    """Upgrade schema."""
     pass
 
 
 def downgrade() -> None:
-    """Downgrade schema."""
     pass
 
 ```
@@ -932,6 +1140,8 @@ from typing import List
 
 from fastapi import APIRouter, Depends, status, HTTPException, Response, BackgroundTasks
 from fastapi import Query
+from fastapi.responses import JSONResponse
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.database.db import get_db
@@ -942,6 +1152,8 @@ from app.services.document_service import (
     get_document_by_id,
     delete_document,
     process_document_background,
+    hash_content,
+    get_document_by_hash
 )
 
 router = APIRouter()
@@ -954,18 +1166,47 @@ async def create_document(
         background_tasks: BackgroundTasks,
         db: Session = Depends(get_db)
 ):
+    cleaned_content = payload.content.strip()
+    file_hash = hash_content(cleaned_content)
+
+    existing_doc = get_document_by_hash(db, file_hash)
+    if existing_doc:
+        return JSONResponse(
+            status_code=409,
+            content={
+                "detail": "Document with identical content already exists",
+                "existing_document_id": existing_doc.id
+            }
+        )
+
     db_document = Document(
         title=payload.title,
-        content=payload.content,
+        content=cleaned_content,
+        content_hash=file_hash,
         status="processing"
     )
     db.add(db_document)
-    db.commit()
+
+    try:
+        db.commit()
+    except IntegrityError:
+
+        db.rollback()
+        existing_doc = get_document_by_hash(db, file_hash)
+        return JSONResponse(
+            status_code=409,
+            content={
+                "detail": "Document with identical content already exists",
+                "existing_document_id": existing_doc.id if existing_doc else None
+            }
+        )
+
+    db.refresh(db_document)
 
     background_tasks.add_task(
         process_document_background,
         document_id=db_document.id,
-        content=payload.content
+        content=cleaned_content
     )
 
     return {
@@ -1008,7 +1249,10 @@ async def read_document(id: int, db: Session = Depends(get_db)):
         "title": db_document.title,
         "content": db_document.content,
         "status": db_document.status,
-        "chunk_count": len(db_document.chunks) if db_document.chunks else 0
+        "chunk_count": len(db_document.chunks) if db_document.chunks else 0,
+        "chunking_time_ms": db_document.chunking_time_ms,
+        "embedding_time_ms": db_document.embedding_time_ms,
+        "total_processing_time_ms": db_document.total_processing_time_ms
     }
 
 
@@ -1084,13 +1328,87 @@ async def search(
         for row in results
     ]
 
-    redis_client.setex(
+    redis_client.set(
         cache_key,
-        settings.tasks_cache_ttl,
-        json.dumps(formatted_results, ensure_ascii=False)
+        json.dumps(formatted_results, ensure_ascii=False),
+        ex=settings.search_cache_ttl
     )
 
     return formatted_results
+
+```
+
+`app/api/system.py`:
+
+```py
+import logging
+from contextlib import closing
+
+from fastapi import APIRouter, Response
+from sqlalchemy import text
+from starlette import status
+
+from app.core.redis import get_redis_client
+from app.database.db import get_db
+from app.schemas import ReadinessResponse
+from app.services.embedding_service import get_embedding
+
+logger = logging.getLogger(__name__)
+router = APIRouter()
+
+
+def check_database() -> str:
+    try:
+        with closing(next(get_db())) as db:
+            db.execute(text("SELECT 1"))
+        return "ok"
+    except Exception as e:
+        logger.error(f"Failed to connect with database: {e}")
+        return "unreachable"
+
+
+def check_redis() -> str:
+    try:
+        get_redis_client().ping()
+        return "ok"
+    except Exception as e:
+        logger.error(f"Failed to connect with Redis: {e}")
+        return "unreachable"
+
+
+async def check_embedding_model() -> str:
+    try:
+        await get_embedding("healthcheck")
+        return "ok"
+    except Exception as e:
+        logger.error(f"Failed to connect with embedding model: {e}")
+        return "unreachable"
+
+
+@router.get("/live")
+def system_alive():
+    return {"status": "alive"}
+
+
+@router.get("/ready", response_model=ReadinessResponse)
+async def system_ready(response: Response):
+    checks = {
+        "database": check_database(),
+        "redis": check_redis(),
+        "embedding_model": await check_embedding_model()
+    }
+
+    if all(status_value == "ok" for status_value in checks.values()):
+        return {
+            "status": "ready",
+            "checks": checks
+        }
+
+    response.status_code = status.HTTP_503_SERVICE_UNAVAILABLE
+    return {
+        "status": "unavailable",
+        "checks": checks
+    }
 
 ```
 
@@ -1106,7 +1424,7 @@ class Settings(BaseSettings):
     database_url: str
     test_database_url: str
     redis_url: str = "redis://redis:6379/0"
-    tasks_cache_ttl: int = 60
+    search_cache_ttl: int = 60
 
     db_host: str = Field(validation_alias="POSTGRES_HOST")
     db_port: int = Field(validation_alias="POSTGRES_PORT")
@@ -1286,7 +1604,7 @@ def get_db():
 
 ```py
 from pgvector.sqlalchemy import Vector
-from sqlalchemy import Column, Integer, String, Text, ForeignKey
+from sqlalchemy import Column, Integer, String, Text, ForeignKey, Float
 from sqlalchemy.orm import relationship
 
 from app.database.base import Base
@@ -1299,6 +1617,10 @@ class Document(Base):
     title = Column(String, nullable=False)
     content = Column(Text, nullable=False)
     status = Column(String(20), server_default='completed', default='processing')
+    content_hash = Column(String(64), nullable=False)
+    chunking_time_ms = Column(Float, nullable=True)
+    embedding_time_ms = Column(Float, nullable=True)
+    total_processing_time_ms = Column(Float, nullable=True)
 
     chunks = relationship(
         "Chunk",
@@ -1328,6 +1650,7 @@ from fastapi.responses import JSONResponse
 
 from app.api.documents import router as document_router
 from app.api.search import router as search_router
+from app.api.system import router as system_router
 from app.config import settings
 from app.core.context import request_id_ctx
 from app.core.logging import setup_logging
@@ -1335,7 +1658,7 @@ from app.core.middleware import register_middlewares, logger
 
 setup_logging()
 app = FastAPI(title=settings.app_title)
-
+app.include_router(system_router, prefix="/system", tags=["System"])
 app.include_router(document_router, prefix="/api/documents", tags=["Documents"])
 app.include_router(search_router, prefix="/api/search", tags=["Search"])
 
@@ -1364,6 +1687,8 @@ async def global_exception_handler(exc: Exception) -> JSONResponse:
 `app/schemas.py`:
 
 ```py
+from typing import Optional
+
 from pydantic import BaseModel, field_validator
 
 
@@ -1395,7 +1720,14 @@ class SearchResult(BaseModel):
 
 class DocumentDetail(DocumentResponse):
     content: str
+    chunking_time_ms: Optional[float] = None
+    embedding_time_ms: Optional[float] = None
+    total_processing_time_ms: Optional[float] = None
 
+
+class ReadinessResponse(BaseModel):
+    status: str
+    checks: dict[str, str]
 ```
 
 `app/services/chunking_service.py`:
@@ -1421,8 +1753,8 @@ def chunk_text(text: str, chunk_size: int = 200, overlap: int = 50):
 `app/services/document_service.py`:
 
 ```py
+import hashlib
 import logging
-from contextlib import closing
 
 from sqlalchemy.orm import Session
 
@@ -1464,11 +1796,22 @@ def invalidate_search_cache():
         redis_client.delete(*keys_to_delete)
 
 
+import time
+from contextlib import closing
+
+
 async def process_document_background(document_id: int, content: str):
     with closing(next(get_db())) as db:
         try:
+            start_chunk = time.perf_counter()
             chunked_payload = chunk_text(content)
+            chunking_time_ms = (time.perf_counter() - start_chunk) * 1000
+
+            start_embed = time.perf_counter()
             vectors = await get_embeddings(chunked_payload)
+            embedding_time_ms = (time.perf_counter() - start_embed) * 1000
+
+            total_processing_time_ms = chunking_time_ms + embedding_time_ms
 
             chunks_to_insert = [
                 Chunk(content=c_content, document_id=document_id, embedding=vector)
@@ -1476,7 +1819,12 @@ async def process_document_background(document_id: int, content: str):
             ]
             db.add_all(chunks_to_insert)
 
-            db.query(Document).filter(Document.id == document_id).update({"status": "completed"})
+            db.query(Document).filter(Document.id == document_id).update({
+                "status": "completed",
+                "chunking_time_ms": chunking_time_ms,
+                "embedding_time_ms": embedding_time_ms,
+                "total_processing_time_ms": total_processing_time_ms
+            })
             db.commit()
 
             invalidate_search_cache()
@@ -1486,6 +1834,14 @@ async def process_document_background(document_id: int, content: str):
             db.rollback()
             db.query(Document).filter(Document.id == document_id).update({"status": "failed"})
             db.commit()
+
+
+def hash_content(content: str) -> str:
+    return hashlib.sha256(content.strip().encode()).hexdigest()
+
+
+def get_document_by_hash(db: Session, content_hash: str):
+    return db.query(Document).filter(Document.content_hash == content_hash).first()
 
 ```
 
@@ -1551,6 +1907,14 @@ services:
       timeout: 2s
       retries: 5
 
+  test_redis:
+    image: redis:7-alpine
+    healthcheck:
+      test: [ "CMD", "redis-cli", "ping" ]
+      interval: 2s
+      timeout: 2s
+      retries: 5
+
   test-runner:
     build:
       context: .
@@ -1568,8 +1932,11 @@ services:
       - POSTGRES_USER=test_user
       - POSTGRES_PASSWORD=test_password123!
       - POSTGRES_DB=rag_api_test_db
+      - REDIS_URL=redis://test_redis:6379/0
     depends_on:
       test_db:
+        condition: service_healthy
+      test_redis:
         condition: service_healthy
     command: sh -c "alembic upgrade head && pytest -v --tb=short"
 ```
@@ -1588,7 +1955,7 @@ services:
       redis:
         condition: service_healthy
     healthcheck:
-      test: [ "CMD", "curl", "-f", "http://localhost:8000/docs" ]
+      test: [ "CMD", "curl", "-f", "http://localhost:8000/system/ready" ]
       interval: 10s
       timeout: 5s
       retries: 3
@@ -1779,11 +2146,12 @@ if __name__ == "__main__":
 `tests/test_api.py`:
 
 ```py
-from unittest.mock import patch, AsyncMock
+from unittest.mock import AsyncMock, patch
 
 from fastapi.testclient import TestClient
 
 from app.main import app
+from app.services import document_service
 
 client = TestClient(app)
 
@@ -1988,5 +2356,295 @@ def test_exception_handler_returns_expected_format():
 
     assert "boom" not in str(data)
     assert "traceback" not in str(data).lower()
+
+
+def test_search_returns_cache_hit_on_repeated_query():
+    unique_phrase = "cache hit unique marker phrase alpha"
+    client.post(
+        "/api/documents",
+        json={"title": "Cache Hit Doc", "content": unique_phrase},
+    )
+
+    first_response = client.get("/api/search", params={"q": unique_phrase, "top_k": 3})
+    assert first_response.status_code == 200
+    assert first_response.headers["X-Cache"] == "MISS"
+
+    second_response = client.get("/api/search", params={"q": unique_phrase, "top_k": 3})
+    assert second_response.status_code == 200
+    assert second_response.headers["X-Cache"] == "HIT"
+    assert second_response.json() == first_response.json()
+
+
+def test_search_returns_cache_miss_on_new_query():
+    unique_phrase = "cache miss unique marker phrase beta never seen before"
+
+    response = client.get("/api/search", params={"q": unique_phrase, "top_k": 3})
+    assert response.status_code == 200
+    assert response.headers["X-Cache"] == "MISS"
+
+
+def test_search_cache_invalidated_after_document_completion():
+    unique_phrase = "invalidation unique marker phrase gamma"
+
+    first_response = client.get("/api/search", params={"q": unique_phrase, "top_k": 5})
+    assert first_response.status_code == 200
+    assert first_response.headers["X-Cache"] == "MISS"
+
+    cached_response = client.get("/api/search", params={"q": unique_phrase, "top_k": 5})
+    assert cached_response.headers["X-Cache"] == "HIT"
+
+    client.post(
+        "/api/documents",
+        json={"title": "Invalidation Doc", "content": unique_phrase},
+    )
+
+    after_completion_response = client.get("/api/search", params={"q": unique_phrase, "top_k": 5})
+    assert after_completion_response.status_code == 200
+    assert after_completion_response.headers["X-Cache"] == "MISS"
+
+    contents = [r["content"] for r in after_completion_response.json()]
+    assert any(unique_phrase in c for c in contents)
+
+
+def test_search_different_top_k_produces_different_cache_key():
+    unique_phrase = "top k unique marker phrase delta"
+    client.post(
+        "/api/documents",
+        json={"title": "Top K Doc", "content": unique_phrase},
+    )
+
+    response_top_k_three = client.get("/api/search", params={"q": unique_phrase, "top_k": 3})
+    assert response_top_k_three.status_code == 200
+    assert response_top_k_three.headers["X-Cache"] == "MISS"
+
+    response_top_k_five = client.get("/api/search", params={"q": unique_phrase, "top_k": 5})
+    assert response_top_k_five.status_code == 200
+    assert response_top_k_five.headers["X-Cache"] == "MISS"
+
+
+def test_create_duplicate_completed_document_returns_409():
+    content = "Unique content for duplicate check completed."
+
+    first_resp = client.post(
+        "/api/documents",
+        json={"title": "Original Completed", "content": content}
+    )
+    assert first_resp.status_code == 202
+    doc_id = first_resp.json()["id"]
+
+    detail = client.get(f"/api/documents/{doc_id}")
+    assert detail.status_code == 200
+    assert detail.json()["status"] == "completed"
+
+    duplicate_resp = client.post(
+        "/api/documents",
+        json={"title": "Duplicate Completed", "content": content}
+    )
+    assert duplicate_resp.status_code == 409
+    data = duplicate_resp.json()
+    assert data["detail"] == "Document with identical content already exists"
+    assert data["existing_document_id"] == doc_id
+
+
+def test_create_duplicate_processing_document_returns_409():
+    content = "Unique content for duplicate check processing."
+
+    with patch("app.api.documents.process_document_background", new_callable=AsyncMock):
+        first_resp = client.post(
+            "/api/documents",
+            json={"title": "Original Processing", "content": content}
+        )
+        assert first_resp.status_code == 202
+        doc_id = first_resp.json()["id"]
+
+        duplicate_resp = client.post(
+            "/api/documents",
+            json={"title": "Duplicate Processing", "content": content}
+        )
+        assert duplicate_resp.status_code == 409
+        data = duplicate_resp.json()
+        assert data["detail"] == "Document with identical content already exists"
+        assert data["existing_document_id"] == doc_id
+
+
+def test_different_content_creates_new_document_successfully():
+    resp_one = client.post(
+        "/api/documents",
+        json={"title": "Doc One", "content": "Content number one."}
+    )
+    resp_two = client.post(
+        "/api/documents",
+        json={"title": "Doc Two", "content": "Content number two."}
+    )
+
+    assert resp_one.status_code == 202
+    assert resp_two.status_code == 202
+    assert resp_one.json()["id"] != resp_two.json()["id"]
+
+
+def test_document_fields_and_latency_lifecycle():
+    content = "Lifecycle test content for hashes and latencies."
+
+    with patch("app.api.documents.process_document_background", new_callable=AsyncMock):
+        create_resp = client.post(
+            "/api/documents",
+            json={"title": "Lifecycle Doc", "content": content}
+        )
+        doc_id = create_resp.json()["id"]
+
+        processing_detail = client.get(f"/api/documents/{doc_id}").json()
+
+        assert processing_detail.get("chunking_time_ms") is None
+        assert processing_detail.get("embedding_time_ms") is None
+        assert processing_detail.get("total_processing_time_ms") is None
+
+    completed_resp = client.post(
+        "/api/documents",
+        json={"title": "Lifecycle Doc Actual", "content": "Completely new distinct text to process."}
+    )
+    comp_doc_id = completed_resp.json()["id"]
+
+    completed_detail = client.get(f"/api/documents/{comp_doc_id}").json()
+    assert completed_detail["status"] == "completed"
+
+    assert completed_detail["chunking_time_ms"] is not None
+    assert completed_detail["chunking_time_ms"] > 0
+
+    assert completed_detail["embedding_time_ms"] is not None
+    assert completed_detail["embedding_time_ms"] > 0
+
+    assert completed_detail["total_processing_time_ms"] is not None
+    assert completed_detail["total_processing_time_ms"] > 0
+
+    expected_total = completed_detail["chunking_time_ms"] + completed_detail["embedding_time_ms"]
+    assert completed_detail["total_processing_time_ms"] == expected_total
+
+
+def test_content_hash_unique_constraint_returns_409_on_race():
+    """
+    Simulates two near-simultaneous identical POSTs both passing the application-level
+    get_document_by_hash() pre-check (because neither has committed yet when the other
+    checks). get_document_by_hash is mocked to return None for the first two calls —
+    the pre-check on request 1 and the pre-check on request 2 — so both requests reach
+    db.commit(). The first commit succeeds and creates the row. The second commit hits
+    the real UNIQUE constraint on documents.content_hash (added in
+    add_unique_constraint_to_content_hash) and raises IntegrityError, which
+    create_document() catches, rolls back, and turns into a 409 — using a *real*
+    (unmocked) get_document_by_hash() call to resolve existing_document_id, which is why
+    the mock only forces None for the first two calls and falls through to the real
+    function afterwards.
+    """
+    content = "Race condition content for unique constraint test."
+
+    real_get_document_by_hash = document_service.get_document_by_hash
+    call_count = {"n": 0}
+
+    def fake_get_document_by_hash(db, content_hash):
+        call_count["n"] += 1
+        if call_count["n"] <= 2:
+            return None
+        return real_get_document_by_hash(db, content_hash)
+
+    with patch("app.api.documents.get_document_by_hash", side_effect=fake_get_document_by_hash):
+        first_resp = client.post(
+            "/api/documents",
+            json={"title": "Race First", "content": content}
+        )
+        assert first_resp.status_code == 202
+        doc_id = first_resp.json()["id"]
+
+        second_resp = client.post(
+            "/api/documents",
+            json={"title": "Race Second", "content": content}
+        )
+
+    assert call_count["n"] == 3
+    assert second_resp.status_code == 409
+    data = second_resp.json()
+    assert data["detail"] == "Document with identical content already exists"
+    assert data["existing_document_id"] == doc_id
+
+
+def test_content_hash_is_correctly_stored_after_creation():
+    content = "Content hash verification test content."
+
+    response = client.post(
+        "/api/documents",
+        json={"title": "Hash Check Doc", "content": content}
+    )
+    assert response.status_code == 202
+
+    expected_hash = document_service.hash_content(content)
+
+    from app.database.db import get_db
+    db = next(get_db())
+    try:
+        stored_doc = document_service.get_document_by_hash(db, expected_hash)
+        assert stored_doc is not None
+        assert stored_doc.content_hash == expected_hash
+    finally:
+        db.close()
+
+
+def test_system_live_always_returns_200():
+    response = client.get("/system/live")
+    assert response.status_code == 200
+    assert response.json() == {"status": "alive"}
+
+
+def test_system_ready_returns_200_when_all_dependencies_available():
+    with patch("app.api.system.check_database", return_value="ok"), \
+            patch("app.api.system.check_redis", return_value="ok"), \
+            patch("app.api.system.check_embedding_model", new_callable=AsyncMock, return_value="ok"):
+        response = client.get("/system/ready")
+        assert response.status_code == 200
+        data = response.json()
+        assert data["status"] == "ready"
+
+
+def test_system_ready_returns_503_when_database_unreachable():
+    with patch("app.api.system.check_database", return_value="unreachable"), \
+            patch("app.api.system.check_redis", return_value="ok"), \
+            patch("app.api.system.check_embedding_model", new_callable=AsyncMock, return_value="ok"):
+        response = client.get("/system/ready")
+        assert response.status_code == 503
+        data = response.json()
+        assert data["status"] == "unavailable"
+
+
+def test_system_ready_returns_503_when_redis_unreachable():
+    with patch("app.api.system.check_database", return_value="ok"), \
+            patch("app.api.system.check_redis", return_value="unreachable"), \
+            patch("app.api.system.check_embedding_model", new_callable=AsyncMock, return_value="ok"):
+        response = client.get("/system/ready")
+        assert response.status_code == 503
+        data = response.json()
+        assert data["status"] == "unavailable"
+
+
+def test_system_ready_checks_structure_is_correct_in_both_cases():
+    with patch("app.api.system.check_database", return_value="ok"), \
+            patch("app.api.system.check_redis", return_value="ok"), \
+            patch("app.api.system.check_embedding_model", new_callable=AsyncMock, return_value="ok"):
+        response_ok = client.get("/system/ready")
+        data_ok = response_ok.json()
+        assert "checks" in data_ok
+        assert data_ok["checks"] == {
+            "database": "ok",
+            "redis": "ok",
+            "embedding_model": "ok"
+        }
+
+    with patch("app.api.system.check_database", return_value="unreachable"), \
+            patch("app.api.system.check_redis", return_value="unreachable"), \
+            patch("app.api.system.check_embedding_model", new_callable=AsyncMock, return_value="unreachable"):
+        response_err = client.get("/system/ready")
+        data_err = response_err.json()
+        assert "checks" in data_err
+        assert data_err["checks"] == {
+            "database": "unreachable",
+            "redis": "unreachable",
+            "embedding_model": "unreachable"
+        }
 
 ```

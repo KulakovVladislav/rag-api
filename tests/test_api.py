@@ -436,3 +436,65 @@ def test_content_hash_is_correctly_stored_after_creation():
         assert stored_doc.content_hash == expected_hash
     finally:
         db.close()
+
+
+def test_system_live_always_returns_200():
+    response = client.get("/system/live")
+    assert response.status_code == 200
+    assert response.json() == {"status": "alive"}
+
+
+def test_system_ready_returns_200_when_all_dependencies_available():
+    with patch("app.api.system.check_database", return_value="ok"), \
+            patch("app.api.system.check_redis", return_value="ok"), \
+            patch("app.api.system.check_embedding_model", new_callable=AsyncMock, return_value="ok"):
+        response = client.get("/system/ready")
+        assert response.status_code == 200
+        data = response.json()
+        assert data["status"] == "ready"
+
+
+def test_system_ready_returns_503_when_database_unreachable():
+    with patch("app.api.system.check_database", return_value="unreachable"), \
+            patch("app.api.system.check_redis", return_value="ok"), \
+            patch("app.api.system.check_embedding_model", new_callable=AsyncMock, return_value="ok"):
+        response = client.get("/system/ready")
+        assert response.status_code == 503
+        data = response.json()
+        assert data["status"] == "unavailable"
+
+
+def test_system_ready_returns_503_when_redis_unreachable():
+    with patch("app.api.system.check_database", return_value="ok"), \
+            patch("app.api.system.check_redis", return_value="unreachable"), \
+            patch("app.api.system.check_embedding_model", new_callable=AsyncMock, return_value="ok"):
+        response = client.get("/system/ready")
+        assert response.status_code == 503
+        data = response.json()
+        assert data["status"] == "unavailable"
+
+
+def test_system_ready_checks_structure_is_correct_in_both_cases():
+    with patch("app.api.system.check_database", return_value="ok"), \
+            patch("app.api.system.check_redis", return_value="ok"), \
+            patch("app.api.system.check_embedding_model", new_callable=AsyncMock, return_value="ok"):
+        response_ok = client.get("/system/ready")
+        data_ok = response_ok.json()
+        assert "checks" in data_ok
+        assert data_ok["checks"] == {
+            "database": "ok",
+            "redis": "ok",
+            "embedding_model": "ok"
+        }
+
+    with patch("app.api.system.check_database", return_value="unreachable"), \
+            patch("app.api.system.check_redis", return_value="unreachable"), \
+            patch("app.api.system.check_embedding_model", new_callable=AsyncMock, return_value="unreachable"):
+        response_err = client.get("/system/ready")
+        data_err = response_err.json()
+        assert "checks" in data_err
+        assert data_err["checks"] == {
+            "database": "unreachable",
+            "redis": "unreachable",
+            "embedding_model": "unreachable"
+        }

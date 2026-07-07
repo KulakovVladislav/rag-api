@@ -20,6 +20,7 @@ in the background, so a 50-page document no longer ties up a Gunicorn worker for
 - [Content Deduplication](#content-deduplication)
 - [Search Result Caching](#search-result-caching)
 - [Observability](#observability)
+- [Health Checks](#health-checks)
 - [Getting Started](#getting-started)
 - [API Reference](#api-reference)
 - [Running Tests](#running-tests)
@@ -39,6 +40,8 @@ RAG API implements the core pipeline of a document question-answering system:
 - Semantic search finds the most relevant chunks via cosine similarity, and only ever searches `completed` documents
 - Search results are cached in Redis and automatically invalidated as soon as new content finishes processing
 - Every request is tagged with a request ID and timed, for request-level tracing in the logs
+- Liveness and readiness probes (`/system/live`, `/system/ready`) back the Docker healthcheck and gate when
+  Nginx starts routing traffic to the app
 - Everything runs locally — embeddings are generated with `sentence-transformers` (`all-MiniLM-L6-v2`)
 
 ---
@@ -190,6 +193,60 @@ Every request is wrapped by `ProfilerAndExceptionMiddleware`:
 
 ---
 
+## Health Checks
+
+Two endpoints under `/system`, split by purpose (liveness vs. readiness) so orchestration and reverse-proxy
+health checks target the right one:
+
+### `GET /system/live`
+
+Liveness probe. Always returns `200` with `{"status": "alive"}` as long as the process can respond to a
+request — it does **not** touch the database, Redis, or the embedding model. Answers only "is the process up",
+never "is it working correctly".
+
+### `GET /system/ready`
+
+Readiness probe. Checks the three hard dependencies on every call:
+
+- **`database`** — opens a fresh session via `get_db()` and runs `SELECT 1`
+- **`redis`** — `PING`s the Redis client
+- **`embedding_model`** — runs a real embedding call (`get_embedding("healthcheck")`) through
+  `sentence-transformers`, so a model that failed to load or a broken inference path is caught too, not just
+  connectivity
+
+Each check independently returns `"ok"` or `"unreachable"` — an exception in any check is caught and logged,
+never allowed to bubble up and 500 the health endpoint itself.
+
+```json
+// 200 — all dependencies healthy
+{
+  "status": "ready",
+  "checks": {
+    "database": "ok",
+    "redis": "ok",
+    "embedding_model": "ok"
+  }
+}
+```
+
+```json
+// 503 — at least one dependency down
+{
+  "status": "unavailable",
+  "checks": {
+    "database": "unreachable",
+    "redis": "ok",
+    "embedding_model": "ok"
+  }
+}
+```
+
+`/system/ready` returns `503 Service Unavailable` unless *all* checks pass — a single failing dependency is
+enough to mark the whole service not-ready, which is what `docker-compose.yml`'s `app` healthcheck polls
+(`curl -f http://localhost:8000/system/ready`) to decide when Nginx should start routing traffic to it.
+
+---
+
 ## Project Structure
 
 ```
@@ -197,7 +254,8 @@ rag-api/
 ├── app/
 │   ├── api/
 │   │   ├── documents.py          # POST/GET/DELETE /api/documents, background task trigger, dedup check
-│   │   └── search.py             # GET /api/search (Redis cache, filters status="completed")
+│   │   ├── search.py             # GET /api/search (Redis cache, filters status="completed")
+│   │   └── system.py             # GET /system/live, /system/ready (DB, Redis, embedding model checks)
 │   ├── core/
 │   │   ├── context.py            # ContextVar carrying the current request_id
 │   │   ├── middleware.py         # Request timing + request-id tagging + fallback error handling
@@ -216,7 +274,7 @@ rag-api/
 │   ├── config.py                 # Pydantic settings (DB, Redis, cache TTL)
 │   └── main.py                   # FastAPI app, router registration, global exception handler
 ├── alembic/                      # Database migrations (status, HNSW index, content_hash + metrics)
-├── tests/                        # Pytest test suite (22 tests)
+├── tests/                        # Pytest test suite (26 tests)
 ├── docker-compose.yml            # Production stack (app + Postgres/pgvector + Redis + Nginx)
 ├── docker-compose.test.yml       # Isolated test stack
 ├── Dockerfile                    # Multi-stage, non-root
@@ -357,6 +415,12 @@ Deletes a document and its chunks (cascade). Returns `204` on success, `404` if 
 
 ---
 
+### `GET /system/live` / `GET /system/ready`
+
+Liveness and readiness probes — see [Health Checks](#health-checks) for the full breakdown.
+
+---
+
 ## Running Tests
 
 Tests run against an isolated PostgreSQL container with `tmpfs` — no persistent data, no side effects.
@@ -365,7 +429,7 @@ Tests run against an isolated PostgreSQL container with `tmpfs` — no persisten
 docker compose -f docker-compose.test.yml up --build --abort-on-container-exit
 ```
 
-22 tests cover:
+26 tests cover:
 
 - **Async lifecycle** — immediate `202`/`processing` response, `completed` status with correct `chunk_count` and
   populated `*_time_ms` fields once background processing finishes, a mocked-failure path landing on
@@ -376,6 +440,9 @@ docker compose -f docker-compose.test.yml up --build --abort-on-container-exit
   `top_k` values produce different cache keys, and the cache is invalidated once a document finishes processing.
 - **CRUD / validation / error handling** — listing, fetching, deleting documents (incl. `404`s), empty/whitespace
   content rejection (`422`), score ordering, and the global exception handler's response shape.
+- **Health checks** — `/system/live` always returns `200`; `/system/ready` returns `200` when database, Redis,
+  and the embedding model all check out, and `503` if any single one fails, with the per-check breakdown
+  verified in both the healthy and unhealthy response bodies.
 
 ---
 

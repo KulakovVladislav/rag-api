@@ -34,3 +34,8 @@ class DocumentDetail(DocumentResponse):
     chunking_time_ms: Optional[float] = None
     embedding_time_ms: Optional[float] = None
     total_processing_time_ms: Optional[float] = None
+
+
+class ReadinessResponse(BaseModel):
+    status: str
+    checks: dict[str, str]
