@@ -48,16 +48,16 @@ RAG API implements the core pipeline of a document question-answering system:
 
 ## Tech Stack
 
-| Layer           | Technology                                    |
-|-----------------|-----------------------------------------------|
-| API             | FastAPI + Gunicorn / Uvicorn                  |
-| Background Jobs | FastAPI `BackgroundTasks`                     |
-| Vector Storage  | PostgreSQL 17 + pgvector                      |
-| Embeddings      | sentence-transformers (`all-MiniLM-L6-v2`)    |
-| Cache           | Redis                                         |
-| Migrations      | Alembic                                       |
-| Reverse Proxy   | Nginx                                         |
-| Infrastructure  | Docker Compose                                |
+| Layer           | Technology                                 |
+|-----------------|--------------------------------------------|
+| API             | FastAPI + Gunicorn / Uvicorn               |
+| Background Jobs | FastAPI `BackgroundTasks`                  |
+| Vector Storage  | PostgreSQL 17 + pgvector                   |
+| Embeddings      | sentence-transformers (`all-MiniLM-L6-v2`) |
+| Cache           | Redis                                      |
+| Migrations      | Alembic                                    |
+| Reverse Proxy   | Nginx                                      |
+| Infrastructure  | Docker Compose                             |
 | Testing         | Pytest + isolated PostgreSQL/Redis containers |
 
 ---
@@ -134,8 +134,9 @@ the tradeoff and when this needs to graduate to Celery/RQ + a worker pool).
 
 **Chunks are batch-inserted.** Once all chunks for a document are embedded, they're written with a single
 `db.add_all(chunks_to_insert)` + one `commit()` — one round trip to Postgres instead of one `INSERT` per chunk.
-The wall-clock time of that batch insert is measured and logged separately from chunking/embedding time (see
-[Observability](#observability)), so a slow-insert regression is visible independently of a slow-embedding one.
+Its wall-clock time isn't separately measured today (see [Observability](#observability)) — only
+`chunking_time_ms` and `embedding_time_ms` are persisted, so an insert-latency regression wouldn't currently
+show up in either field.
 
 **Search only returns finished documents.** `GET /api/search` joins `chunks` to `documents` and filters
 `status == 'completed'` in SQL, so a query can never return a chunk from a document that's still mid-ingestion or
@@ -202,21 +203,15 @@ Every request is wrapped by `ProfilerAndExceptionMiddleware`:
   a client always gets `{"detail": "Internal Server Error", "request_id": "..."}` instead of a raw traceback,
   and the `request_id` in the response lets you grep the exact log line for that failure.
 
-**Background-task timing isn't request-scoped, so it's logged separately.** `process_document_background()` runs
-after the response has already gone out, outside any request/response cycle the middleware wraps — there's no
-`request_id` context to attach it to, since the request that triggered it has already finished. It logs its own
-line to the same `profiler` logger once the chunk batch insert completes:
-
-```
-INFO:     INSERT time [add_all]: 4.82ms, chunks: 6, document_id: 42:
-```
-
-This isolates DB-insert latency from the `chunking_time_ms` / `embedding_time_ms` fields already persisted on the
-`Document` row (see [Content Deduplication](#content-deduplication) migration) — those two cover the CPU-bound part
-of the pipeline, this log line covers the I/O-bound part, so a regression in either shows up without conflating the
-two.
+**Not currently logged: per-batch insert timing.** `process_document_background()` runs after the response has
+already gone out, outside the request/response cycle the middleware wraps — so it has no `request_id` to log
+against even if it emitted a line. Today it doesn't: the chunk insert (`db.add_all(chunks_to_insert)`) isn't
+separately timed or logged anywhere, only `chunking_time_ms` and `embedding_time_ms` are persisted on the
+`Document` row. If insert latency needs visibility later, it'd need its own timer and log line (with a
+manually-attached identifier, since there's no request context to pull one from).
 
 ---
+
 
 ## Health Checks
 
@@ -399,9 +394,9 @@ visibility into how much of the pipeline's latency was chunking vs. embedding.
 Lists documents with pagination. Each item includes `status` and `chunk_count`.
 
 | Parameter | Type    | Default | Description       |
-|-----------|---------|---------|-------------------|
-| `limit`   | integer | `10`    | Page size (1–100) |
-| `offset`  | integer | `0`     | Pagination offset |
+|-----------|---------|---------|--------------------|
+| `limit`   | integer | `10`    | Page size (1–100)  |
+| `offset`  | integer | `0`     | Pagination offset  |
 
 ---
 
@@ -414,7 +409,7 @@ header.
 **Query parameters**
 
 | Parameter | Type    | Default  | Description                 |
-|-----------|---------|----------|-----------------------------|
+|-----------|---------|----------|------------------------------|
 | `q`       | string  | required | Search query                |
 | `top_k`   | integer | `5`      | Number of results to return |
 
@@ -479,12 +474,12 @@ docker compose -f docker-compose.test.yml up --build --abort-on-container-exit
 
 See `.env.example` for all required variables. The most relevant ones beyond standard Postgres/app settings:
 
-| Variable                             | Used by                               | Default                | Notes                                                                                                                                                                                                                                                  |
-|--------------------------------------|---------------------------------------|------------------------|--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
-| `REDIS_URL`                          | `app/config.py` → `redis_url`         | `redis://redis:6379/0` | Backs both search caching and cache invalidation.                                                                                                                                                                                                      |
-| `SEARCH_CACHE_TTL`                   | `app/config.py` → `search_cache_ttl`  | `60` (seconds)         | ⚠️ `.env.example` currently defines this as `TASKS_CACHE_TTL`, which `Settings` does not read — the app silently falls back to the `60`s default regardless of that value. Rename it to `SEARCH_CACHE_TTL` in your `.env` if you need a different TTL. |
-| `DATABASE_URL` / `TEST_DATABASE_URL` | `app/config.py`                       | — (required)           | Full SQLAlchemy connection strings; `TEST_DATABASE_URL` is used by the isolated test stack.                                                                                                                                                            |
-| `POSTGRES_HOST` / `POSTGRES_PORT`    | `app/config.py` → `db_host`/`db_port` | — (required)           | Read via `validation_alias`, independent of `DATABASE_URL`; used wherever the app needs the host/port pair directly rather than a full DSN.                                                                                                            |
+| Variable                             | Used by                              | Default                | Notes                                                                                                                                                                                                                                                  |
+|---------------------------------------|---------------------------------------|--------------------------|----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| `REDIS_URL`                          | `app/config.py` → `redis_url`        | `redis://redis:6379/0` | Backs both search caching and cache invalidation.                                                                                                                                                                                                      |
+| `SEARCH_CACHE_TTL`                   | `app/config.py` → `search_cache_ttl` | `60` (seconds)         | ⚠️ `.env.example` currently defines this as `TASKS_CACHE_TTL`, which `Settings` does not read — the app silently falls back to the `60`s default regardless of that value. Rename it to `SEARCH_CACHE_TTL` in your `.env` if you need a different TTL. |
+| `DATABASE_URL` / `TEST_DATABASE_URL` | `app/config.py`                      | — (required)           | Full SQLAlchemy connection strings; `TEST_DATABASE_URL` is used by the isolated test stack.                                                                                                                                                            |
+| `POSTGRES_HOST` / `POSTGRES_PORT`    | `app/config.py` → `db_host`/`db_port` | — (required)            | Read via `validation_alias`, independent of `DATABASE_URL`; used wherever the app needs the host/port pair directly rather than a full DSN.                                                                                                            |
 
 ---
 
@@ -523,9 +518,9 @@ jobs.
 
 Chunks for a document are inserted in a single `db.add_all(chunks_to_insert)` + one `commit()`, rather than one
 `INSERT` per chunk. This is one network round trip to Postgres regardless of chunk count, instead of N — the
-difference is negligible for a handful of chunks but compounds directly with document length. The insert's wall
-time is logged independently of chunking/embedding time (see [Observability](#observability)) specifically so this
-tradeoff stays measurable if chunk counts grow.
+difference is negligible for a handful of chunks but compounds directly with document length. Its wall time isn't
+separately measured (see [Observability](#observability)) — worth adding if chunk counts grow enough that insert
+latency needs its own visibility, distinct from `chunking_time_ms`/`embedding_time_ms`.
 
 **Why an explicit `status` column instead of inferring state from `chunk_count`**
 
@@ -571,7 +566,7 @@ Tracking against `ТИКЕТ: Async Document Processing с фоновой обр
 | AC-6                        | `GET /api/search` excludes non-`completed` documents via SQL `JOIN` + filter (not Python-side filtering)                                                                                                                                                                                              | ✅      |
 | Migration default           | Explicit `server_default` for existing rows so old documents stay searchable                                                                                                                                                                                                                          | ✅      |
 | AC-7 (tests)                | 4 new tests added (`202`+`processing`, `completed`+`chunk_count` after processing, mocked failure → `failed`, search excludes `processing` chunks). Old `test_post_document_returns_201_with_chunk_count` rewritten to match the `202` contract. 14 tests total, all pre-existing behavior preserved. | ✅      |
-| Refactor checklist (Слой 5) | `process_document_background()` moved to `app/services/document_service.py`; `app/api/documents.py` now only imports and wires it into the route.                                                                                                                                                     | ✅      |
+| Refactor checklist (Слой 5) | `process_document_background()` moved to `app/services/document_service.py`; `app/api/documents.py` now only imports and wires it into the route.                                                                                                                                                    | ✅      |
 | CS-фундамент (Слой 4)       | Event loop blocking vs. Celery isolation, FSM vs. inferred state race condition, and DB session lifecycle are written up in [Engineering Decisions](#engineering-decisions) below.                                                                                                                    | ✅      |
 
 ### Out of scope (by request)
@@ -589,7 +584,7 @@ Shipped after the initial async-processing ticket, in later commits:
   application-level dedup check's race window, paired with `IntegrityError` handling in `create_document()`.
 - Redis-backed search result caching with `X-Cache` headers and completion-triggered invalidation.
 - Request-id tagging and per-request latency logging (`X-Request-ID`, `X-Response-Time`) via
-  `ProfilerAndExceptionMiddleware`, plus a separate `profiler` log line for background chunk-insert timing.
+  `ProfilerAndExceptionMiddleware`.
 - `/system/live` and `/system/ready` liveness/readiness probes (database, Redis, embedding model checks), wired
   into `docker-compose.yml`'s `app` healthcheck.
 - Duplicate HNSW index removed (`ab8ab01e1746` had created it once; a later migration branch created a second
