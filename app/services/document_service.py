@@ -1,5 +1,7 @@
 import hashlib
 import logging
+import time
+from contextlib import closing
 
 from sqlalchemy.orm import Session
 
@@ -41,10 +43,6 @@ def invalidate_search_cache():
         redis_client.delete(*keys_to_delete)
 
 
-import time
-from contextlib import closing
-
-
 async def process_document_background(document_id: int, content: str):
     with closing(next(get_db())) as db:
         try:
@@ -62,7 +60,13 @@ async def process_document_background(document_id: int, content: str):
                 Chunk(content=c_content, document_id=document_id, embedding=vector)
                 for c_content, vector in zip(chunked_payload, vectors)
             ]
+            start_insert = time.perf_counter()
             db.add_all(chunks_to_insert)
+            db.commit()
+            insert_time_ms = (time.perf_counter() - start_insert) * 1000
+            logging.getLogger("profiler").info(
+                f"INSERT time [add_all]: {insert_time_ms:.2f}ms, chunks: {len(chunks_to_insert)}, document_id: {document_id}"
+            )
 
             db.query(Document).filter(Document.id == document_id).update({
                 "status": "completed",

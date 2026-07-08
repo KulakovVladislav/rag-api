@@ -16,11 +16,11 @@ in the background, so a 50-page document no longer ties up a Gunicorn worker for
 - [Tech Stack](#tech-stack)
 - [Architecture](#architecture)
 - [Async Document Processing](#async-document-processing)
-- [Project Structure](#project-structure)
 - [Content Deduplication](#content-deduplication)
 - [Search Result Caching](#search-result-caching)
 - [Observability](#observability)
 - [Health Checks](#health-checks)
+- [Project Structure](#project-structure)
 - [Getting Started](#getting-started)
 - [API Reference](#api-reference)
 - [Running Tests](#running-tests)
@@ -48,17 +48,17 @@ RAG API implements the core pipeline of a document question-answering system:
 
 ## Tech Stack
 
-| Layer           | Technology                                 |
-|-----------------|--------------------------------------------|
-| API             | FastAPI + Gunicorn / Uvicorn               |
-| Background Jobs | FastAPI `BackgroundTasks`                  |
-| Vector Storage  | PostgreSQL 17 + pgvector                   |
-| Embeddings      | sentence-transformers (`all-MiniLM-L6-v2`) |
-| Cache           | Redis                                      |
-| Migrations      | Alembic                                    |
-| Reverse Proxy   | Nginx                                      |
-| Infrastructure  | Docker Compose                             |
-| Testing         | Pytest + isolated PostgreSQL container     |
+| Layer           | Technology                                    |
+|-----------------|-----------------------------------------------|
+| API             | FastAPI + Gunicorn / Uvicorn                  |
+| Background Jobs | FastAPI `BackgroundTasks`                     |
+| Vector Storage  | PostgreSQL 17 + pgvector                      |
+| Embeddings      | sentence-transformers (`all-MiniLM-L6-v2`)    |
+| Cache           | Redis                                         |
+| Migrations      | Alembic                                       |
+| Reverse Proxy   | Nginx                                         |
+| Infrastructure  | Docker Compose                                |
+| Testing         | Pytest + isolated PostgreSQL/Redis containers |
 
 ---
 
@@ -91,7 +91,7 @@ POST /api/documents
   → return 202 immediately            — client is never blocked on embedding
   → [background] chunk_text()         — splits content into overlapping chunks
   → [background] get_embeddings()     — encodes chunks via sentence-transformers
-  → [background] store chunks         — saves to PostgreSQL with vector(384) column
+  → [background] db.add_all(chunks) + commit  — batch-inserts all chunks in one round trip
   → [background] status="completed" (or "failed" on exception)
 
 GET /api/search?q=...
@@ -132,6 +132,11 @@ API, after the response has already been sent. It's the minimal version of "don'
 It is **not** real parallelism for CPU-bound work (see [Engineering Decisions](#engineering-decisions) below for
 the tradeoff and when this needs to graduate to Celery/RQ + a worker pool).
 
+**Chunks are batch-inserted.** Once all chunks for a document are embedded, they're written with a single
+`db.add_all(chunks_to_insert)` + one `commit()` — one round trip to Postgres instead of one `INSERT` per chunk.
+The wall-clock time of that batch insert is measured and logged separately from chunking/embedding time (see
+[Observability](#observability)), so a slow-insert regression is visible independently of a slow-embedding one.
+
 **Search only returns finished documents.** `GET /api/search` joins `chunks` to `documents` and filters
 `status == 'completed'` in SQL, so a query can never return a chunk from a document that's still mid-ingestion or
 that failed halfway through.
@@ -156,6 +161,12 @@ POST /api/documents  (content already ingested)
 This makes retried/duplicated client uploads (double-submits, retried background jobs, re-imported files) free
 instead of silently doubling storage and embedding cost. The check is on exact content, not fuzzy/semantic
 similarity — two documents with the same meaning but different wording are treated as distinct.
+
+A database-level `UNIQUE` constraint on `content_hash` (`add_unique_constraint_to_content_hash`) backs this up:
+if two identical requests both pass the in-app `get_document_by_hash()` pre-check before either commits — a
+genuine race — the second `INSERT` is rejected by Postgres itself with an `IntegrityError`, which
+`create_document()` catches and turns into the same `409` response, re-resolving `existing_document_id` against
+the row that actually won the race.
 
 ---
 
@@ -184,12 +195,26 @@ Every request is wrapped by `ProfilerAndExceptionMiddleware`:
   a `ContextVar` for the duration of the request — so it's available to any logger call downstream without
   threading it through every function signature.
 - The response carries back `X-Request-ID` and `X-Response-Time` (milliseconds) headers.
-- Every request is logged as a single structured line: method, path, status code, and latency, tagged with the
-  `request_id`.
+- Every request is logged as a single structured line via the `profiler` logger: method, path, status code, and
+  latency, tagged with the `request_id`.
 - Unhandled exceptions are caught at two levels — the middleware (logs the stack trace, returns a `500` with the
   `request_id`) and a global FastAPI `@app.exception_handler(Exception)` in `main.py` as a second safety net — so
   a client always gets `{"detail": "Internal Server Error", "request_id": "..."}` instead of a raw traceback,
   and the `request_id` in the response lets you grep the exact log line for that failure.
+
+**Background-task timing isn't request-scoped, so it's logged separately.** `process_document_background()` runs
+after the response has already gone out, outside any request/response cycle the middleware wraps — there's no
+`request_id` context to attach it to, since the request that triggered it has already finished. It logs its own
+line to the same `profiler` logger once the chunk batch insert completes:
+
+```
+INFO:     INSERT time [add_all]: 4.82ms, chunks: 6, document_id: 42:
+```
+
+This isolates DB-insert latency from the `chunking_time_ms` / `embedding_time_ms` fields already persisted on the
+`Document` row (see [Content Deduplication](#content-deduplication) migration) — those two cover the CPU-bound part
+of the pipeline, this log line covers the I/O-bound part, so a regression in either shows up without conflating the
+two.
 
 ---
 
@@ -206,7 +231,8 @@ never "is it working correctly".
 
 ### `GET /system/ready`
 
-Readiness probe. Checks the three hard dependencies on every call:
+Readiness probe (response validated against the `ReadinessResponse` schema). Checks the three hard dependencies
+on every call:
 
 - **`database`** — opens a fresh session via `get_db()` and runs `SELECT 1`
 - **`redis`** — `PING`s the Redis client
@@ -270,13 +296,13 @@ rag-api/
 │   │   ├── embedding_service.py  # sentence-transformers wrapper (runs off the event loop via threadpool)
 │   │   ├── chunking_service.py   # Fixed-size overlapping text chunking
 │   │   └── search_service.py     # Cosine distance → similarity score conversion
-│   ├── schemas.py                 # Pydantic request/response models
+│   ├── schemas.py                 # Pydantic request/response models (incl. ReadinessResponse)
 │   ├── config.py                 # Pydantic settings (DB, Redis, cache TTL)
 │   └── main.py                   # FastAPI app, router registration, global exception handler
-├── alembic/                      # Database migrations (status, HNSW index, content_hash + metrics)
-├── tests/                        # Pytest test suite (26 tests)
+├── alembic/                      # Database migrations (status, HNSW index, content_hash + metrics, unique constraint)
+├── tests/                        # Pytest test suite (29 tests)
 ├── docker-compose.yml            # Production stack (app + Postgres/pgvector + Redis + Nginx)
-├── docker-compose.test.yml       # Isolated test stack
+├── docker-compose.test.yml       # Isolated test stack (Postgres + Redis containers)
 ├── Dockerfile                    # Multi-stage, non-root
 └── nginx.conf                    # Rate limiting (per-route), proxy config
 ```
@@ -423,26 +449,29 @@ Liveness and readiness probes — see [Health Checks](#health-checks) for the fu
 
 ## Running Tests
 
-Tests run against an isolated PostgreSQL container with `tmpfs` — no persistent data, no side effects.
+Tests run against isolated PostgreSQL and Redis containers with `tmpfs` for Postgres — no persistent data, no
+side effects.
 
 ```bash
 docker compose -f docker-compose.test.yml up --build --abort-on-container-exit
 ```
 
-26 tests cover:
+29 tests cover:
 
 - **Async lifecycle** — immediate `202`/`processing` response, `completed` status with correct `chunk_count` and
   populated `*_time_ms` fields once background processing finishes, a mocked-failure path landing on
   `status="failed"`, and search excluding chunks from non-`completed` documents.
 - **Deduplication** — duplicate content against a `completed` document returns `409`, duplicate content against a
-  still-`processing` document also returns `409`, and genuinely different content is always accepted.
+  still-`processing` document also returns `409`, genuinely different content is always accepted, the stored
+  `content_hash` matches an independently-computed hash, and a simulated race (both requests pass the Python-level
+  pre-check) is still caught by the database `UNIQUE` constraint and turned into a `409`.
 - **Search caching** — repeated identical queries return a cache hit, a new query is a cache miss, different
   `top_k` values produce different cache keys, and the cache is invalidated once a document finishes processing.
+- **Health checks** — `/system/live` always returns `200`; `/system/ready` returns `200` when database, Redis,
+  and the embedding model all check out, and `503` if any single one (database or Redis) fails, with the
+  per-check breakdown verified in both the healthy and unhealthy response bodies.
 - **CRUD / validation / error handling** — listing, fetching, deleting documents (incl. `404`s), empty/whitespace
   content rejection (`422`), score ordering, and the global exception handler's response shape.
-- **Health checks** — `/system/live` always returns `200`; `/system/ready` returns `200` when database, Redis,
-  and the embedding model all check out, and `503` if any single one fails, with the per-check breakdown
-  verified in both the healthy and unhealthy response bodies.
 
 ---
 
@@ -450,11 +479,12 @@ docker compose -f docker-compose.test.yml up --build --abort-on-container-exit
 
 See `.env.example` for all required variables. The most relevant ones beyond standard Postgres/app settings:
 
-| Variable                             | Used by                              | Default                | Notes                                                                                                                                                                                                                                                  |
-|--------------------------------------|--------------------------------------|------------------------|--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
-| `REDIS_URL`                          | `app/config.py` → `redis_url`        | `redis://redis:6379/0` | Backs both search caching and cache invalidation.                                                                                                                                                                                                      |
-| `SEARCH_CACHE_TTL`                   | `app/config.py` → `search_cache_ttl` | `60` (seconds)         | ⚠️ `.env.example` currently defines this as `TASKS_CACHE_TTL`, which `Settings` does not read — the app silently falls back to the `60`s default regardless of that value. Rename it to `SEARCH_CACHE_TTL` in your `.env` if you need a different TTL. |
-| `DATABASE_URL` / `TEST_DATABASE_URL` | `app/config.py`                      | — (required)           | Full SQLAlchemy connection strings; `TEST_DATABASE_URL` is used by the isolated test stack.                                                                                                                                                            |
+| Variable                             | Used by                               | Default                | Notes                                                                                                                                                                                                                                                  |
+|--------------------------------------|---------------------------------------|------------------------|--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| `REDIS_URL`                          | `app/config.py` → `redis_url`         | `redis://redis:6379/0` | Backs both search caching and cache invalidation.                                                                                                                                                                                                      |
+| `SEARCH_CACHE_TTL`                   | `app/config.py` → `search_cache_ttl`  | `60` (seconds)         | ⚠️ `.env.example` currently defines this as `TASKS_CACHE_TTL`, which `Settings` does not read — the app silently falls back to the `60`s default regardless of that value. Rename it to `SEARCH_CACHE_TTL` in your `.env` if you need a different TTL. |
+| `DATABASE_URL` / `TEST_DATABASE_URL` | `app/config.py`                       | — (required)           | Full SQLAlchemy connection strings; `TEST_DATABASE_URL` is used by the isolated test stack.                                                                                                                                                            |
+| `POSTGRES_HOST` / `POSTGRES_PORT`    | `app/config.py` → `db_host`/`db_port` | — (required)           | Read via `validation_alias`, independent of `DATABASE_URL`; used wherever the app needs the host/port pair directly rather than a full DSN.                                                                                                            |
 
 ---
 
@@ -489,6 +519,14 @@ a process restart. `BackgroundTasks` is the right call for getting unblocked tod
 ingestion volume or embedding latency grows enough that a single failed deploy can't be allowed to drop in-flight
 jobs.
 
+**Batch insert (`add_all`) over per-chunk `INSERT`**
+
+Chunks for a document are inserted in a single `db.add_all(chunks_to_insert)` + one `commit()`, rather than one
+`INSERT` per chunk. This is one network round trip to Postgres regardless of chunk count, instead of N — the
+difference is negligible for a handful of chunks but compounds directly with document length. The insert's wall
+time is logged independently of chunking/embedding time (see [Observability](#observability)) specifically so this
+tradeoff stays measurable if chunk counts grow.
+
 **Why an explicit `status` column instead of inferring state from `chunk_count`**
 
 `chunk_count == 0` is ambiguous: it's true both for a document that hasn't started processing yet *and* for one
@@ -505,6 +543,15 @@ the request has already returned a response and that generator-based session is 
 Reusing it would mean operating on a session that may already be closed, mid-rollback, or being recycled by
 SQLAlchemy's pool for an unrelated request. The background function opens its own session via `get_db()`/
 `closing(...)`, independent of any request's lifecycle, and is responsible for its own `commit`/`rollback`.
+
+**A real `UNIQUE` constraint on top of the application-level dedup check**
+
+The `get_document_by_hash()` pre-check in `create_document()` handles the common case cheaply (no DB constraint
+violation, no exception path) but can't see an in-flight, uncommitted insert from a concurrent request — that's a
+genuine TOCTOU race, not a hypothetical one, under any real concurrent load. The `UNIQUE` constraint on
+`documents.content_hash` (`add_unique_constraint_to_content_hash`) is the actual source of truth: whichever
+request commits second is rejected by Postgres itself via `IntegrityError`, which is caught and converted to the
+same `409` shape the pre-check path returns.
 
 ---
 
@@ -532,15 +579,19 @@ Tracking against `ТИКЕТ: Async Document Processing с фоновой обр
 Hard Mode (Слой 7: `GET /api/documents/{id}/status` with `Retry-After`, and the idempotency check for
 duplicate in-flight `POST`s) was intentionally left out of this pass.
 
-### Follow-up iteration (beyond the original ticket)
+### Follow-up iterations (beyond the original ticket)
 
 Shipped after the initial async-processing ticket, in later commits:
 
 - Content deduplication via SHA-256 `content_hash`, with per-document `chunking_time_ms` / `embedding_time_ms` /
   `total_processing_time_ms` metrics added in the same migration.
+- A `UNIQUE` constraint on `documents.content_hash` (`add_unique_constraint_to_content_hash`), closing the
+  application-level dedup check's race window, paired with `IntegrityError` handling in `create_document()`.
 - Redis-backed search result caching with `X-Cache` headers and completion-triggered invalidation.
 - Request-id tagging and per-request latency logging (`X-Request-ID`, `X-Response-Time`) via
-  `ProfilerAndExceptionMiddleware`.
+  `ProfilerAndExceptionMiddleware`, plus a separate `profiler` log line for background chunk-insert timing.
+- `/system/live` and `/system/ready` liveness/readiness probes (database, Redis, embedding model checks), wired
+  into `docker-compose.yml`'s `app` healthcheck.
 - Duplicate HNSW index removed (`ab8ab01e1746` had created it once; a later migration branch created a second
   one, cleaned up via `c1698571fb87` + a merge migration).
 
@@ -551,6 +602,8 @@ Shipped after the initial async-processing ticket, in later commits:
   logic never executes for this path — the function compensates by calling `db.commit()` / `db.rollback()` itself
   explicitly, which works correctly, but it's a slightly unusual use of the dependency generator. Left as-is since
   it's functionally correct; worth a comment if it trips someone up later.
+- `check_database()` in `app/api/system.py` uses the same `closing(next(get_db()))` pattern as background
+  processing, for the same reason — it needs a session outside of FastAPI's request-scoped `Depends(get_db)`.
 
 ---
 
