@@ -1,11 +1,13 @@
 from typing import Optional
 
-from pydantic import BaseModel, field_validator
+from pydantic import BaseModel, field_validator, Field, ConfigDict
 
 
 class DocumentCreate(BaseModel):
     title: str
     content: str
+    doc_metadata: Optional[dict] = Field(default=None, alias="metadata")
+    model_config = ConfigDict(populate_by_name=True)
 
     @field_validator("content")
     @classmethod
@@ -27,6 +29,8 @@ class SearchResult(BaseModel):
     document_title: str
     content: str
     score: float
+    doc_metadata: Optional[dict] = Field(default=None, alias="metadata")
+    model_config = ConfigDict(populate_by_name=True)
 
 
 class DocumentDetail(DocumentResponse):
@@ -34,6 +38,8 @@ class DocumentDetail(DocumentResponse):
     chunking_time_ms: Optional[float] = None
     embedding_time_ms: Optional[float] = None
     total_processing_time_ms: Optional[float] = None
+    doc_metadata: Optional[dict] = Field(default=None, alias="metadata")
+    model_config = ConfigDict(populate_by_name=True)
 
 
 class ReadinessResponse(BaseModel):

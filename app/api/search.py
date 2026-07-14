@@ -37,7 +37,7 @@ async def search(
     vector = await get_embedding(q)
     distance = Chunk.embedding.cosine_distance(vector)
     results = (
-        db.query(Chunk, Document.title, distance.label("distance"))
+        db.query(Chunk, Document.title, Document.doc_metadata, distance.label("distance"))
         .join(Document, Chunk.document_id == Document.id)
         .filter(Document.status == "completed")
         .order_by(distance)
@@ -50,7 +50,8 @@ async def search(
             "chunk_id": row.Chunk.id,
             "document_title": row.title,
             "content": row.Chunk.content,
-            "score": calculate_cosine_score(row.distance)
+            "score": calculate_cosine_score(row.distance),
+            "metadata": row.doc_metadata,
         }
         for row in results
     ]

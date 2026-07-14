@@ -46,7 +46,8 @@ async def create_document(
         title=payload.title,
         content=cleaned_content,
         content_hash=file_hash,
-        status="processing"
+        status="processing",
+        doc_metadata=payload.doc_metadata
     )
     db.add(db_document)
 
@@ -115,7 +116,8 @@ async def read_document(id: int, db: Session = Depends(get_db)):
         "chunk_count": len(db_document.chunks) if db_document.chunks else 0,
         "chunking_time_ms": db_document.chunking_time_ms,
         "embedding_time_ms": db_document.embedding_time_ms,
-        "total_processing_time_ms": db_document.total_processing_time_ms
+        "total_processing_time_ms": db_document.total_processing_time_ms,
+        "metadata": db_document.doc_metadata,
     }
 
 

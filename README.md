@@ -48,16 +48,16 @@ RAG API implements the core pipeline of a document question-answering system:
 
 ## Tech Stack
 
-| Layer           | Technology                                 |
-|-----------------|--------------------------------------------|
-| API             | FastAPI + Gunicorn / Uvicorn               |
-| Background Jobs | FastAPI `BackgroundTasks`                  |
-| Vector Storage  | PostgreSQL 17 + pgvector                   |
-| Embeddings      | sentence-transformers (`all-MiniLM-L6-v2`) |
-| Cache           | Redis                                      |
-| Migrations      | Alembic                                    |
-| Reverse Proxy   | Nginx                                      |
-| Infrastructure  | Docker Compose                             |
+| Layer           | Technology                                    |
+|-----------------|-----------------------------------------------|
+| API             | FastAPI + Gunicorn / Uvicorn                  |
+| Background Jobs | FastAPI `BackgroundTasks`                     |
+| Vector Storage  | PostgreSQL 17 + pgvector                      |
+| Embeddings      | sentence-transformers (`all-MiniLM-L6-v2`)    |
+| Cache           | Redis                                         |
+| Migrations      | Alembic                                       |
+| Reverse Proxy   | Nginx                                         |
+| Infrastructure  | Docker Compose                                |
 | Testing         | Pytest + isolated PostgreSQL/Redis containers |
 
 ---
@@ -91,7 +91,7 @@ POST /api/documents
   → return 202 immediately            — client is never blocked on embedding
   → [background] chunk_text()         — splits content into overlapping chunks
   → [background] get_embeddings()     — encodes chunks via sentence-transformers
-  → [background] db.add_all(chunks) + commit  — batch-inserts all chunks in one round trip
+  → [background] db.bulk_save_objects(chunks) + commit  — batch-inserts all chunks in one round trip
   → [background] status="completed" (or "failed" on exception)
 
 GET /api/search?q=...
@@ -133,7 +133,8 @@ It is **not** real parallelism for CPU-bound work (see [Engineering Decisions](#
 the tradeoff and when this needs to graduate to Celery/RQ + a worker pool).
 
 **Chunks are batch-inserted.** Once all chunks for a document are embedded, they're written with a single
-`db.add_all(chunks_to_insert)` + one `commit()` — one round trip to Postgres instead of one `INSERT` per chunk.
+`db.bulk_save_objects(chunks_to_insert)` + one `commit()` — one round trip to Postgres instead of one `INSERT` per
+chunk.
 Its wall-clock time isn't separately measured today (see [Observability](#observability)) — only
 `chunking_time_ms` and `embedding_time_ms` are persisted, so an insert-latency regression wouldn't currently
 show up in either field.
@@ -198,20 +199,20 @@ Every request is wrapped by `ProfilerAndExceptionMiddleware`:
 - The response carries back `X-Request-ID` and `X-Response-Time` (milliseconds) headers.
 - Every request is logged as a single structured line via the `profiler` logger: method, path, status code, and
   latency, tagged with the `request_id`.
-- Unhandled exceptions are caught at two levels — the middleware (logs the stack trace, returns a `500` with the
-  `request_id`) and a global FastAPI `@app.exception_handler(Exception)` in `main.py` as a second safety net — so
-  a client always gets `{"detail": "Internal Server Error", "request_id": "..."}` instead of a raw traceback,
-  and the `request_id` in the response lets you grep the exact log line for that failure.
+- Unhandled exceptions are caught inside `ProfilerAndExceptionMiddleware` itself (`app/core/middleware.py`) — a
+  single `try/except Exception` around `call_next()` — which logs the stack trace and returns a `500` with the
+  `request_id`, so a client always gets `{"detail": "Internal Server Error", "request_id": "..."}` instead of a
+  raw traceback, and the `request_id` in the response lets you grep the exact log line for that failure. There is
+  no separate `@app.exception_handler` in `main.py` — the middleware is the only catch-all.
 
 **Not currently logged: per-batch insert timing.** `process_document_background()` runs after the response has
 already gone out, outside the request/response cycle the middleware wraps — so it has no `request_id` to log
-against even if it emitted a line. Today it doesn't: the chunk insert (`db.add_all(chunks_to_insert)`) isn't
+against even if it emitted a line. Today it doesn't: the chunk insert (`db.bulk_save_objects(chunks_to_insert)`) isn't
 separately timed or logged anywhere, only `chunking_time_ms` and `embedding_time_ms` are persisted on the
 `Document` row. If insert latency needs visibility later, it'd need its own timer and log line (with a
 manually-attached identifier, since there's no request context to pull one from).
 
 ---
-
 
 ## Health Checks
 
@@ -279,7 +280,7 @@ rag-api/
 │   │   └── system.py             # GET /system/live, /system/ready (DB, Redis, embedding model checks)
 │   ├── core/
 │   │   ├── context.py            # ContextVar carrying the current request_id
-│   │   ├── middleware.py         # Request timing + request-id tagging + fallback error handling
+│   │   ├── middleware.py         # Request timing + request-id tagging + catch-all error handling
 │   │   ├── logging.py            # "profiler" logger config, injects request_id into log lines
 │   │   └── redis.py              # Cached Redis client factory
 │   ├── database/
@@ -293,7 +294,7 @@ rag-api/
 │   │   └── search_service.py     # Cosine distance → similarity score conversion
 │   ├── schemas.py                 # Pydantic request/response models (incl. ReadinessResponse)
 │   ├── config.py                 # Pydantic settings (DB, Redis, cache TTL)
-│   └── main.py                   # FastAPI app, router registration, global exception handler
+│   └── main.py                   # FastAPI app, router registration
 ├── alembic/                      # Database migrations (status, HNSW index, content_hash + metrics, unique constraint)
 ├── tests/                        # Pytest test suite (29 tests)
 ├── docker-compose.yml            # Production stack (app + Postgres/pgvector + Redis + Nginx)
@@ -394,9 +395,9 @@ visibility into how much of the pipeline's latency was chunking vs. embedding.
 Lists documents with pagination. Each item includes `status` and `chunk_count`.
 
 | Parameter | Type    | Default | Description       |
-|-----------|---------|---------|--------------------|
-| `limit`   | integer | `10`    | Page size (1–100)  |
-| `offset`  | integer | `0`     | Pagination offset  |
+|-----------|---------|---------|-------------------|
+| `limit`   | integer | `10`    | Page size (1–100) |
+| `offset`  | integer | `0`     | Pagination offset |
 
 ---
 
@@ -409,7 +410,7 @@ header.
 **Query parameters**
 
 | Parameter | Type    | Default  | Description                 |
-|-----------|---------|----------|------------------------------|
+|-----------|---------|----------|-----------------------------|
 | `q`       | string  | required | Search query                |
 | `top_k`   | integer | `5`      | Number of results to return |
 
@@ -466,7 +467,7 @@ docker compose -f docker-compose.test.yml up --build --abort-on-container-exit
   and the embedding model all check out, and `503` if any single one (database or Redis) fails, with the
   per-check breakdown verified in both the healthy and unhealthy response bodies.
 - **CRUD / validation / error handling** — listing, fetching, deleting documents (incl. `404`s), empty/whitespace
-  content rejection (`422`), score ordering, and the global exception handler's response shape.
+  content rejection (`422`), score ordering, and the catch-all exception-handling middleware's response shape.
 
 ---
 
@@ -474,12 +475,12 @@ docker compose -f docker-compose.test.yml up --build --abort-on-container-exit
 
 See `.env.example` for all required variables. The most relevant ones beyond standard Postgres/app settings:
 
-| Variable                             | Used by                              | Default                | Notes                                                                                                                                                                                                                                                  |
-|---------------------------------------|---------------------------------------|--------------------------|----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
-| `REDIS_URL`                          | `app/config.py` → `redis_url`        | `redis://redis:6379/0` | Backs both search caching and cache invalidation.                                                                                                                                                                                                      |
-| `SEARCH_CACHE_TTL`                   | `app/config.py` → `search_cache_ttl` | `60` (seconds)         | ⚠️ `.env.example` currently defines this as `TASKS_CACHE_TTL`, which `Settings` does not read — the app silently falls back to the `60`s default regardless of that value. Rename it to `SEARCH_CACHE_TTL` in your `.env` if you need a different TTL. |
-| `DATABASE_URL` / `TEST_DATABASE_URL` | `app/config.py`                      | — (required)           | Full SQLAlchemy connection strings; `TEST_DATABASE_URL` is used by the isolated test stack.                                                                                                                                                            |
-| `POSTGRES_HOST` / `POSTGRES_PORT`    | `app/config.py` → `db_host`/`db_port` | — (required)            | Read via `validation_alias`, independent of `DATABASE_URL`; used wherever the app needs the host/port pair directly rather than a full DSN.                                                                                                            |
+| Variable                             | Used by                               | Default                | Notes                                                                                                                                                                                                                                                  |
+|--------------------------------------|---------------------------------------|------------------------|--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| `REDIS_URL`                          | `app/config.py` → `redis_url`         | `redis://redis:6379/0` | Backs both search caching and cache invalidation.                                                                                                                                                                                                      |
+| `SEARCH_CACHE_TTL`                   | `app/config.py` → `search_cache_ttl`  | `60` (seconds)         | ⚠️ `.env.example` currently defines this as `TASKS_CACHE_TTL`, which `Settings` does not read — the app silently falls back to the `60`s default regardless of that value. Rename it to `SEARCH_CACHE_TTL` in your `.env` if you need a different TTL. |
+| `DATABASE_URL` / `TEST_DATABASE_URL` | `app/config.py`                       | — (required)           | Full SQLAlchemy connection strings; `TEST_DATABASE_URL` is used by the isolated test stack.                                                                                                                                                            |
+| `POSTGRES_HOST` / `POSTGRES_PORT`    | `app/config.py` → `db_host`/`db_port` | — (required)           | Read via `validation_alias`, independent of `DATABASE_URL`; used wherever the app needs the host/port pair directly rather than a full DSN.                                                                                                            |
 
 ---
 
@@ -514,9 +515,10 @@ a process restart. `BackgroundTasks` is the right call for getting unblocked tod
 ingestion volume or embedding latency grows enough that a single failed deploy can't be allowed to drop in-flight
 jobs.
 
-**Batch insert (`add_all`) over per-chunk `INSERT`**
+**Batch insert (`bulk_save_objects`) over per-chunk `INSERT`**
 
-Chunks for a document are inserted in a single `db.add_all(chunks_to_insert)` + one `commit()`, rather than one
+Chunks for a document are inserted in a single `db.bulk_save_objects(chunks_to_insert)` + one `commit()`, rather than
+one
 `INSERT` per chunk. This is one network round trip to Postgres regardless of chunk count, instead of N — the
 difference is negligible for a handful of chunks but compounds directly with document length. Its wall time isn't
 separately measured (see [Observability](#observability)) — worth adding if chunk counts grow enough that insert
@@ -566,7 +568,7 @@ Tracking against `ТИКЕТ: Async Document Processing с фоновой обр
 | AC-6                        | `GET /api/search` excludes non-`completed` documents via SQL `JOIN` + filter (not Python-side filtering)                                                                                                                                                                                              | ✅      |
 | Migration default           | Explicit `server_default` for existing rows so old documents stay searchable                                                                                                                                                                                                                          | ✅      |
 | AC-7 (tests)                | 4 new tests added (`202`+`processing`, `completed`+`chunk_count` after processing, mocked failure → `failed`, search excludes `processing` chunks). Old `test_post_document_returns_201_with_chunk_count` rewritten to match the `202` contract. 14 tests total, all pre-existing behavior preserved. | ✅      |
-| Refactor checklist (Слой 5) | `process_document_background()` moved to `app/services/document_service.py`; `app/api/documents.py` now only imports and wires it into the route.                                                                                                                                                    | ✅      |
+| Refactor checklist (Слой 5) | `process_document_background()` moved to `app/services/document_service.py`; `app/api/documents.py` now only imports and wires it into the route.                                                                                                                                                     | ✅      |
 | CS-фундамент (Слой 4)       | Event loop blocking vs. Celery isolation, FSM vs. inferred state race condition, and DB session lifecycle are written up in [Engineering Decisions](#engineering-decisions) below.                                                                                                                    | ✅      |
 
 ### Out of scope (by request)

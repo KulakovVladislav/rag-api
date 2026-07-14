@@ -1,5 +1,6 @@
 from pgvector.sqlalchemy import Vector
 from sqlalchemy import Column, Integer, String, Text, ForeignKey, Float
+from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import relationship
 
 from app.database.base import Base
@@ -16,6 +17,7 @@ class Document(Base):
     chunking_time_ms = Column(Float, nullable=True)
     embedding_time_ms = Column(Float, nullable=True)
     total_processing_time_ms = Column(Float, nullable=True)
+    doc_metadata = Column("metadata", JSONB, nullable=True)
 
     chunks = relationship(
         "Chunk",
