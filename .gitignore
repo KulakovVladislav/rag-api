@@ -30,3 +30,6 @@ alembic/versions/__pycache__/
 # Pytest
 .pytest_cache/project_context.txt
 project_context.txt
+*.zip
+.DS_Store
+**/.DS_Store
