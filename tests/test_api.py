@@ -498,3 +498,60 @@ def test_system_ready_checks_structure_is_correct_in_both_cases():
             "redis": "unreachable",
             "embedding_model": "unreachable"
         }
+
+
+def test_document_metadata_is_stored_and_returned_via_get_by_id():
+    metadata = {"source": "docs.fastapi.tiangolo.com", "author": "tiangolo"}
+
+    create_resp = client.post(
+        "/api/documents",
+        json={"title": "Metadata Doc", "content": "Content for metadata storage test.", "metadata": metadata}
+    )
+    assert create_resp.status_code == 202
+    doc_id = create_resp.json()["id"]
+
+    detail = client.get(f"/api/documents/{doc_id}")
+    assert detail.status_code == 200
+    assert detail.json()["metadata"] == metadata
+
+
+def test_document_without_metadata_returns_null():
+    create_resp = client.post(
+        "/api/documents",
+        json={"title": "No Metadata Doc", "content": "Content with no metadata supplied at all."}
+    )
+    assert create_resp.status_code == 202
+    doc_id = create_resp.json()["id"]
+
+    detail = client.get(f"/api/documents/{doc_id}")
+    assert detail.status_code == 200
+    assert detail.json()["metadata"] is None
+
+
+def test_search_results_include_document_metadata():
+    unique_phrase = "metadata search unique marker phrase epsilon"
+    metadata = {"source": "unit-test", "tag": "epsilon"}
+
+    client.post(
+        "/api/documents",
+        json={"title": "Metadata Search Doc", "content": unique_phrase, "metadata": metadata}
+    )
+
+    response = client.get("/api/search", params={"q": unique_phrase})
+    assert response.status_code == 200
+    results = response.json()
+    matching = [r for r in results if unique_phrase in r["content"]]
+    assert len(matching) > 0
+    assert matching[0]["metadata"] == metadata
+
+
+def test_create_document_invalid_metadata_type_returns_422():
+    response = client.post(
+        "/api/documents",
+        json={
+            "title": "Bad Metadata Doc",
+            "content": "Content with an invalid metadata type.",
+            "metadata": "this should be a dict, not a string"
+        }
+    )
+    assert response.status_code == 422

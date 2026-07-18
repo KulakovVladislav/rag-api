@@ -17,6 +17,7 @@ in the background, so a 50-page document no longer ties up a Gunicorn worker for
 - [Architecture](#architecture)
 - [Async Document Processing](#async-document-processing)
 - [Content Deduplication](#content-deduplication)
+- [Document Metadata](#document-metadata)
 - [Search Result Caching](#search-result-caching)
 - [Observability](#observability)
 - [Health Checks](#health-checks)
@@ -37,6 +38,7 @@ RAG API implements the core pipeline of a document question-answering system:
 - Documents are accepted instantly, then chunked and embedded **in the background**
 - Document status (`processing` / `completed` / `failed`) tracks ingestion progress
 - Duplicate content is rejected at ingestion time via a SHA-256 content hash — no wasted embedding work
+- Documents can carry arbitrary, caller-supplied JSON `metadata`, stored as-is and returned on detail/search reads
 - Semantic search finds the most relevant chunks via cosine similarity, and only ever searches `completed` documents
 - Search results are cached in Redis and automatically invalidated as soon as new content finishes processing
 - Every request is tagged with a request ID and timed, for request-level tracing in the logs
@@ -172,6 +174,37 @@ the row that actually won the race.
 
 ---
 
+## Document Metadata
+
+`POST /api/documents` accepts an optional `metadata` field — any JSON object, stored verbatim in a `documents`
+column of type `JSONB` (`add_metadata_to_documents` migration). The app doesn't validate its shape or read any
+particular key out of it; it's a free-form place for a caller to attach whatever context matters to them (source
+URL, author, ingestion batch, ACL tags, etc.), queryable later directly in Postgres via `JSONB` operators even
+though the app itself doesn't expose querying by metadata today.
+
+**Why the Python attribute is `doc_metadata`, not `metadata`.** On the `Document` SQLAlchemy model, the column is
+declared as `doc_metadata = Column("metadata", JSONB, nullable=True)` — the *database* column name is `metadata`,
+but the *Python* attribute is `doc_metadata`. This is required, not stylistic: `metadata` is already a reserved
+attribute name on every SQLAlchemy declarative model (`Base.metadata` holds the schema's `MetaData` object, used
+internally for migrations/table reflection), so a column literally named `metadata` would collide with it.
+Pydantic schemas (`DocumentCreate`, `DocumentDetail`, `SearchResult`) mirror this with
+`doc_metadata: Optional[dict] = Field(default=None, alias="metadata")` plus
+`model_config = ConfigDict(populate_by_name=True)`, so the wire format (JSON body/response key `"metadata"`)
+stays clean while the Python code underneath uses `doc_metadata` throughout.
+
+**Where it does and doesn't appear.** `metadata` is accepted on `POST /api/documents` and returned by
+`GET /api/documents/{id}` and `GET /api/search` — but *not* by the `202` creation response or the
+`GET /api/documents` list, because both of those use the plain `DocumentResponse` schema, which was never
+extended with the field. If you need to confirm what metadata was stored right after creating a document, fetch
+it via `GET /api/documents/{id}` rather than trusting the `202` body.
+
+**Not yet covered by tests.** `tests/test_api.py` has no test exercising `metadata` — not on create, not on the
+detail/search read paths, and not for what happens with the default `None` case. This is a real gap, not a
+formality: nothing currently guards against the alias wiring silently breaking (e.g. a future refactor swapping
+`Field(alias=...)` for something that doesn't round-trip through `populate_by_name`).
+
+---
+
 ## Search Result Caching
 
 `GET /api/search` is backed by Redis. The cache key is an MD5 hash of the normalized query (`lowercased`,
@@ -284,7 +317,7 @@ rag-api/
 │   │   ├── logging.py            # "profiler" logger config, injects request_id into log lines
 │   │   └── redis.py              # Cached Redis client factory
 │   ├── database/
-│   │   ├── models.py             # Document (status, content_hash, timing metrics), Chunk models
+│   │   ├── models.py             # Document (status, content_hash, timing metrics, doc_metadata/JSONB), Chunk models
 │   │   ├── db.py                 # Session management
 │   │   └── base.py               # Declarative base
 │   ├── services/
@@ -292,10 +325,10 @@ rag-api/
 │   │   ├── embedding_service.py  # sentence-transformers wrapper (runs off the event loop via threadpool)
 │   │   ├── chunking_service.py   # Fixed-size overlapping text chunking
 │   │   └── search_service.py     # Cosine distance → similarity score conversion
-│   ├── schemas.py                 # Pydantic request/response models (incl. ReadinessResponse)
+│   ├── schemas.py                 # Pydantic request/response models (incl. ReadinessResponse, metadata alias)
 │   ├── config.py                 # Pydantic settings (DB, Redis, cache TTL)
 │   └── main.py                   # FastAPI app, router registration
-├── alembic/                      # Database migrations (status, HNSW index, content_hash + metrics, unique constraint)
+├── alembic/                      # Database migrations (status, HNSW index, content_hash + metrics, unique constraint, metadata)
 ├── tests/                        # Pytest test suite (29 tests)
 ├── docker-compose.yml            # Production stack (app + Postgres/pgvector + Redis + Nginx)
 ├── docker-compose.test.yml       # Isolated test stack (Postgres + Redis containers)
@@ -336,9 +369,16 @@ wait for embedding to finish.
 ```json
 {
   "title": "FastAPI Guide",
-  "content": "FastAPI is a modern..."
+  "content": "FastAPI is a modern...",
+  "metadata": {
+    "source": "docs.fastapi.tiangolo.com",
+    "author": "tiangolo"
+  }
 }
 ```
+
+`metadata` is optional and accepts any JSON object — stored as-is in a `JSONB` column, not validated or
+interpreted by the app. Omit it (or send `null`) and it's simply not stored.
 
 **Response `202 Accepted`**
 
@@ -350,6 +390,10 @@ wait for embedding to finish.
   "chunk_count": 0
 }
 ```
+
+> Note: the `202` response does **not** echo back `metadata` — `DocumentResponse` (the schema behind both this
+> response and the `GET /api/documents` list) doesn't include the field at all. To confirm what was stored, use
+> `GET /api/documents/{id}` (below), whose `DocumentDetail` schema does include it.
 
 **Response `409 Conflict`** — content already ingested (matched by SHA-256 hash, see
 [Content Deduplication](#content-deduplication))
@@ -380,13 +424,18 @@ Returns the current state of a document, including ingestion status.
   "chunk_count": 4,
   "chunking_time_ms": 2.31,
   "embedding_time_ms": 148.92,
-  "total_processing_time_ms": 151.23
+  "total_processing_time_ms": 151.23,
+  "metadata": {
+    "source": "docs.fastapi.tiangolo.com",
+    "author": "tiangolo"
+  }
 }
 ```
 
 `status` is one of `processing`, `completed`, `failed`. While `processing`, `chunk_count` is `0` and the
 `*_time_ms` fields are `null` — they're populated once background processing finishes, giving per-document
-visibility into how much of the pipeline's latency was chunking vs. embedding.
+visibility into how much of the pipeline's latency was chunking vs. embedding. `metadata` is whatever JSON object
+was supplied at creation, or `null` if none was.
 
 ---
 
@@ -422,10 +471,17 @@ header.
     "chunk_id": 3,
     "document_title": "FastAPI Guide",
     "content": "FastAPI is a modern web framework...",
-    "score": 0.12
+    "score": 0.12,
+    "metadata": {
+      "source": "docs.fastapi.tiangolo.com",
+      "author": "tiangolo"
+    }
   }
 ]
 ```
+
+> `metadata` here is the *parent document's* metadata, carried through the `Chunk`↔`Document` join — every chunk
+> from the same document repeats the same `metadata`, it isn't per-chunk.
 
 > Lower score = higher similarity (cosine distance).
 
@@ -468,6 +524,9 @@ docker compose -f docker-compose.test.yml up --build --abort-on-container-exit
   per-check breakdown verified in both the healthy and unhealthy response bodies.
 - **CRUD / validation / error handling** — listing, fetching, deleting documents (incl. `404`s), empty/whitespace
   content rejection (`422`), score ordering, and the catch-all exception-handling middleware's response shape.
+
+**Not covered yet:** `metadata` (see [Document Metadata](#document-metadata)) — no test exercises setting it on
+create, reading it back via detail/search, or the default-`None` case.
 
 ---
 
@@ -591,6 +650,9 @@ Shipped after the initial async-processing ticket, in later commits:
   into `docker-compose.yml`'s `app` healthcheck.
 - Duplicate HNSW index removed (`ab8ab01e1746` had created it once; a later migration branch created a second
   one, cleaned up via `c1698571fb87` + a merge migration).
+- Free-form JSON `metadata` on documents (`add_metadata_to_documents`, `JSONB` column), accepted on create and
+  returned on detail/search reads — see [Document Metadata](#document-metadata) for the alias wiring and the
+  current test-coverage gap.
 
 ### Smaller things worth a look
 
