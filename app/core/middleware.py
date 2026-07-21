@@ -46,10 +46,14 @@ class ProfilerAndExceptionMiddleware(BaseHTTPMiddleware):
         response.headers["X-Request-ID"] = request_id
 
         logger.info(
-            f"[PROFILER] Method: {request.method} | "
-            f"Path: {request.url.path} | "
-            f"Status: {response.status_code} | "
-            f"Latency: {latency_str}"
+            "request_completed",
+            extra={
+                "event": "request_completed",
+                "method": request.method,
+                "path": str(request.url.path),
+                "status_code": response.status_code,
+                "duration_ms": round(process_time, 2)
+            }
         )
 
         return response

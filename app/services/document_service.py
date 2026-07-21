@@ -1,12 +1,11 @@
 import hashlib
 import logging
 import time
-from contextlib import closing
 
 from sqlalchemy.orm import Session
 
 from app.core.redis import get_redis_client
-from app.database.db import get_db
+from app.database.db import get_db_context
 from app.database.models import Document, Chunk
 from app.services.chunking_service import chunk_text
 from app.services.embedding_service import get_embeddings
@@ -43,8 +42,18 @@ def invalidate_search_cache():
         redis_client.delete(*keys_to_delete)
 
 
-async def process_document_background(document_id: int, content: str):
-    with closing(next(get_db())) as db:
+async def process_document_background(document_id: int, request_id: str, content: str):
+    start_total = time.perf_counter()
+
+    logger.info(
+        "document_processing_started",
+        extra={
+            "document_id": document_id,
+            "request_id": request_id
+        }
+    )
+
+    with get_db_context() as db:
         try:
             start_chunk = time.perf_counter()
             chunked_payload = chunk_text(content)
@@ -54,7 +63,7 @@ async def process_document_background(document_id: int, content: str):
             vectors = await get_embeddings(chunked_payload)
             embedding_time_ms = (time.perf_counter() - start_embed) * 1000
 
-            total_processing_time_ms = chunking_time_ms + embedding_time_ms
+            total_processing_time_ms = (time.perf_counter() - start_total) * 1000
 
             chunks_to_insert = [
                 Chunk(content=c_content, document_id=document_id, embedding=vector)
@@ -68,15 +77,31 @@ async def process_document_background(document_id: int, content: str):
                 "embedding_time_ms": embedding_time_ms,
                 "total_processing_time_ms": total_processing_time_ms
             })
-            db.commit()
 
             invalidate_search_cache()
 
+            logger.info(
+                "document_processing_completed",
+                extra={
+                    "document_id": document_id,
+                    "request_id": request_id,
+                    "chunk_count": len(chunked_payload),
+                    "total_processing_time_ms": total_processing_time_ms
+                }
+            )
+
         except Exception as e:
-            logger.error(f"Error processing document {document_id}: {e}", exc_info=True)
+            logger.error(
+                "document_processing_failed",
+                extra={
+                    "document_id": document_id,
+                    "request_id": request_id,
+                    "error": str(e)
+                },
+                exc_info=True
+            )
             db.rollback()
             db.query(Document).filter(Document.id == document_id).update({"status": "failed"})
-            db.commit()
 
 
 def hash_content(content: str) -> str:

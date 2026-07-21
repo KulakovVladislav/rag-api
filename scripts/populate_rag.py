@@ -3,6 +3,7 @@ import asyncio
 from app.database.db import SessionLocal
 from app.database.models import Document, Chunk
 from app.services.chunking_service import chunk_text
+from app.services.document_service import hash_content
 from app.services.embedding_service import get_embeddings
 
 DATASET = [
@@ -33,7 +34,14 @@ async def main():
             title = f"{template['title']} (Instance #{i})"
             content = f"Document ID-{i}. {template['content']} Additional unique search token: doc_token_{i}."
 
-            db_document = Document(title=title, content=content)
+            content_hash = hash_content(content)
+
+            db_document = Document(
+                title=title,
+                content=content,
+                content_hash=content_hash,
+                status="completed"
+            )
             db.add(db_document)
             db.flush()
 
@@ -44,7 +52,7 @@ async def main():
                 Chunk(content=c_content, document_id=db_document.id, embedding=vector)
                 for c_content, vector in zip(chunked_payload, vectors)
             ]
-            db.add_all(chunks_to_insert)
+            db.bulk_save_objects(chunks_to_insert)
             db.commit()
             print(f"Inserted document {i}/50 with {len(chunked_payload)} chunks.")
     except Exception as e:

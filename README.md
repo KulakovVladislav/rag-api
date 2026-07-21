@@ -20,6 +20,7 @@ in the background, so a 50-page document no longer ties up a Gunicorn worker for
 - [Document Metadata](#document-metadata)
 - [Search Result Caching](#search-result-caching)
 - [Observability](#observability)
+- [Seeding Test Data](#seeding-test-data)
 - [Health Checks](#health-checks)
 - [Project Structure](#project-structure)
 - [Getting Started](#getting-started)
@@ -224,26 +225,89 @@ avoiding repeated embedding-model inference on hot queries.
 
 ## Observability
 
+### Structured JSON logging
+
+Logs are structured JSON, one object per line, emitted via a custom `JsonProfileFormatter`
+(`app/core/logging.py`). Every line has at minimum `timestamp`, `level`, `logger_name`, `message`, and
+`request_id`; anything passed via `logger.info(..., extra={...})` is folded into the same JSON object instead of
+being dropped, so a given event's specific fields (`method`/`path`/`status_code`/`duration_ms` for requests,
+`document_id`/`chunk_count`/`error` for background processing) show up right alongside the standard fields.
+
+Example line for a completed background job:
+
+```json
+{
+  "timestamp": "2026-07-21T14:00:00+00:00",
+  "level": "INFO",
+  "logger_name": "app.services.document_service",
+  "message": "document_processing_completed",
+  "request_id": "a1b2c3d4-...",
+  "document_id": 42,
+  "chunk_count": 6,
+  "total_processing_time_ms": 812.4
+}
+```
+
+### Request tracing
+
 Every request is wrapped by `ProfilerAndExceptionMiddleware`:
 
 - A `request_id` is read from the incoming `X-Request-ID` header, or generated (`uuid4`) if absent, and stored in
   a `ContextVar` for the duration of the request — so it's available to any logger call downstream without
   threading it through every function signature.
 - The response carries back `X-Request-ID` and `X-Response-Time` (milliseconds) headers.
-- Every request is logged as a single structured line via the `profiler` logger: method, path, status code, and
-  latency, tagged with the `request_id`.
+- Every request is logged as a single structured line via the `profiler` logger with `event: "request_completed"`,
+  `method`, `path`, `status_code`, and `duration_ms`, tagged with the `request_id`.
 - Unhandled exceptions are caught inside `ProfilerAndExceptionMiddleware` itself (`app/core/middleware.py`) — a
   single `try/except Exception` around `call_next()` — which logs the stack trace and returns a `500` with the
   `request_id`, so a client always gets `{"detail": "Internal Server Error", "request_id": "..."}` instead of a
   raw traceback, and the `request_id` in the response lets you grep the exact log line for that failure. There is
   no separate `@app.exception_handler` in `main.py` — the middleware is the only catch-all.
 
-**Not currently logged: per-batch insert timing.** `process_document_background()` runs after the response has
-already gone out, outside the request/response cycle the middleware wraps — so it has no `request_id` to log
-against even if it emitted a line. Today it doesn't: the chunk insert (`db.bulk_save_objects(chunks_to_insert)`) isn't
-separately timed or logged anywhere, only `chunking_time_ms` and `embedding_time_ms` are persisted on the
-`Document` row. If insert latency needs visibility later, it'd need its own timer and log line (with a
-manually-attached identifier, since there's no request context to pull one from).
+### Background task logging
+
+`process_document_background()` runs after the response has already gone out — outside the request/response
+cycle the middleware wraps — so the `ContextVar` set by the middleware is already reset by the time it executes
+and `request_id_ctx.get()` would raise `LookupError` there. Instead, `documents.py` reads `request_id_ctx.get()`
+**before** calling `background_tasks.add_task(...)` (while the context is still alive) and passes it as an
+explicit `request_id` parameter, which the background task then logs via `extra={"request_id": ...}` on all
+three of its structured events: `document_processing_started`, `document_processing_completed` (with
+`chunk_count` and `total_processing_time_ms`), and `document_processing_failed` (with `error`). This keeps every
+background log line correlated with the request that triggered it, without relying on the ContextVar surviving
+past the response.
+
+**Not currently logged: per-batch insert timing.** The chunk insert (`db.bulk_save_objects(chunks_to_insert)`)
+isn't separately timed or logged anywhere — only `chunking_time_ms` and `embedding_time_ms` are persisted on the
+`Document` row. If insert latency needs visibility later, it'd need its own timer and log line.
+
+### DB session handling — `get_db_context()`
+
+Two call sites needed a DB session outside of FastAPI's `Depends(get_db)` mechanism: `document_service.py`
+(background task) and `system.py` (health checks). Both previously did `closing(next(get_db()))`, which only
+worked by relying on the generator-based `get_db()` — written for `Depends`, with commit/close code *after* the
+`yield` — being driven to completion by `next()`. That's not guaranteed: `next()` only advances the generator to
+its `yield`; nothing forces it to resume and run the commit/close that follows. It happened to work here only
+because of when the generator object got garbage-collected, which is not something to depend on.
+
+`get_db_context()` (`app/database/db.py`), a plain `@contextlib.contextmanager` with the same
+commit/rollback/close body, replaces that pattern: a `with get_db_context() as db:` block is *guaranteed* to run
+the code after `yield` when the block exits (normally or via exception), because `contextlib` drives the
+generator explicitly via `__exit__`, unlike `next()` on a bare generator.
+
+---
+
+## Seeding Test Data
+
+`scripts/populate_rag.py` inserts 50 sample documents (rotating across four topics) directly with
+`status="completed"`, using the same `hash_content()` and chunking/embedding services as the API itself — so
+seeded documents are immediately visible to `GET /api/search`, with no separate "wait for background processing"
+step.
+
+```bash
+docker compose exec app python scripts/populate_rag.py
+```
+
+Useful for populating a fresh local database with searchable content without manually POSTing 50 documents.
 
 ---
 
@@ -329,7 +393,7 @@ rag-api/
 │   ├── config.py                 # Pydantic settings (DB, Redis, cache TTL)
 │   └── main.py                   # FastAPI app, router registration
 ├── alembic/                      # Database migrations (status, HNSW index, content_hash + metrics, unique constraint, metadata)
-├── tests/                        # Pytest test suite (29 tests)
+├── tests/                        # Pytest test suite (40 tests)
 ├── docker-compose.yml            # Production stack (app + Postgres/pgvector + Redis + Nginx)
 ├── docker-compose.test.yml       # Isolated test stack (Postgres + Redis containers)
 ├── Dockerfile                    # Multi-stage, non-root
@@ -508,7 +572,7 @@ side effects.
 docker compose -f docker-compose.test.yml up --build --abort-on-container-exit
 ```
 
-29 tests cover:
+40 tests cover:
 
 - **Async lifecycle** — immediate `202`/`processing` response, `completed` status with correct `chunk_count` and
   populated `*_time_ms` fields once background processing finishes, a mocked-failure path landing on
@@ -524,6 +588,13 @@ docker compose -f docker-compose.test.yml up --build --abort-on-container-exit
   per-check breakdown verified in both the healthy and unhealthy response bodies.
 - **CRUD / validation / error handling** — listing, fetching, deleting documents (incl. `404`s), empty/whitespace
   content rejection (`422`), score ordering, and the catch-all exception-handling middleware's response shape.
+- **Structured logging** — the JSON formatter emits valid JSON with all required fields, a background job's log
+  lines carry the same `request_id` as the triggering request's response header, and a failed document's log
+  line contains the `error` field.
+- **DB session handling** — `get_db_context()` commits and closes on the happy path, and rolls back and closes
+  when the block raises.
+- **`populate_rag.py`** — running the script against a clean database produces documents with
+  `status="completed"` that are immediately visible in `GET /api/search`.
 
 **Not covered yet:** `metadata` (see [Document Metadata](#document-metadata)) — no test exercises setting it on
 create, reading it back via detail/search, or the default-`None` case.
@@ -534,12 +605,12 @@ create, reading it back via detail/search, or the default-`None` case.
 
 See `.env.example` for all required variables. The most relevant ones beyond standard Postgres/app settings:
 
-| Variable                             | Used by                               | Default                | Notes                                                                                                                                                                                                                                                  |
-|--------------------------------------|---------------------------------------|------------------------|--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
-| `REDIS_URL`                          | `app/config.py` → `redis_url`         | `redis://redis:6379/0` | Backs both search caching and cache invalidation.                                                                                                                                                                                                      |
-| `SEARCH_CACHE_TTL`                   | `app/config.py` → `search_cache_ttl`  | `60` (seconds)         | ⚠️ `.env.example` currently defines this as `TASKS_CACHE_TTL`, which `Settings` does not read — the app silently falls back to the `60`s default regardless of that value. Rename it to `SEARCH_CACHE_TTL` in your `.env` if you need a different TTL. |
-| `DATABASE_URL` / `TEST_DATABASE_URL` | `app/config.py`                       | — (required)           | Full SQLAlchemy connection strings; `TEST_DATABASE_URL` is used by the isolated test stack.                                                                                                                                                            |
-| `POSTGRES_HOST` / `POSTGRES_PORT`    | `app/config.py` → `db_host`/`db_port` | — (required)           | Read via `validation_alias`, independent of `DATABASE_URL`; used wherever the app needs the host/port pair directly rather than a full DSN.                                                                                                            |
+| Variable                             | Used by                               | Default                | Notes                                                                                                                                       |
+|--------------------------------------|---------------------------------------|------------------------|---------------------------------------------------------------------------------------------------------------------------------------------|
+| `REDIS_URL`                          | `app/config.py` → `redis_url`         | `redis://redis:6379/0` | Backs both search caching and cache invalidation.                                                                                           |
+| `SEARCH_CACHE_TTL`                   | `app/config.py` → `search_cache_ttl`  | `60` (seconds)         | Set directly in `.env.example`; override it in your own `.env` if you need a different TTL.                                                 |
+| `DATABASE_URL` / `TEST_DATABASE_URL` | `app/config.py`                       | — (required)           | Full SQLAlchemy connection strings; `TEST_DATABASE_URL` is used by the isolated test stack.                                                 |
+| `POSTGRES_HOST` / `POSTGRES_PORT`    | `app/config.py` → `db_host`/`db_port` | — (required)           | Read via `validation_alias`, independent of `DATABASE_URL`; used wherever the app needs the host/port pair directly rather than a full DSN. |
 
 ---
 
@@ -608,61 +679,6 @@ genuine TOCTOU race, not a hypothetical one, under any real concurrent load. The
 `documents.content_hash` (`add_unique_constraint_to_content_hash`) is the actual source of truth: whichever
 request commits second is rejected by Postgres itself via `IntegrityError`, which is caught and converted to the
 same `409` shape the pre-check path returns.
-
----
-
-## Ticket Status
-
-Tracking against `ТИКЕТ: Async Document Processing с фоновой обработкой`.
-
-### Done
-
-| AC                          | Description                                                                                                                                                                                                                                                                                           | Status |
-|-----------------------------|-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|--------|
-| AC-1                        | `POST /api/documents` returns `202` immediately, body has `id`/`title`/`status`                                                                                                                                                                                                                       | ✅      |
-| AC-2                        | `status` column added via Alembic, `server_default='completed'` for existing rows, app-level `default='processing'` for new rows                                                                                                                                                                      | ✅      |
-| AC-3                        | `GET /api/documents/{id}` returns `status`; `chunk_count=0` while `processing`                                                                                                                                                                                                                        | ✅      |
-| AC-4                        | Successful background run flips status to `completed`, chunks land in DB                                                                                                                                                                                                                              | ✅      |
-| AC-5                        | Exception during background processing flips status to `failed`, error logged with `exc_info`                                                                                                                                                                                                         | ✅      |
-| AC-6                        | `GET /api/search` excludes non-`completed` documents via SQL `JOIN` + filter (not Python-side filtering)                                                                                                                                                                                              | ✅      |
-| Migration default           | Explicit `server_default` for existing rows so old documents stay searchable                                                                                                                                                                                                                          | ✅      |
-| AC-7 (tests)                | 4 new tests added (`202`+`processing`, `completed`+`chunk_count` after processing, mocked failure → `failed`, search excludes `processing` chunks). Old `test_post_document_returns_201_with_chunk_count` rewritten to match the `202` contract. 14 tests total, all pre-existing behavior preserved. | ✅      |
-| Refactor checklist (Слой 5) | `process_document_background()` moved to `app/services/document_service.py`; `app/api/documents.py` now only imports and wires it into the route.                                                                                                                                                     | ✅      |
-| CS-фундамент (Слой 4)       | Event loop blocking vs. Celery isolation, FSM vs. inferred state race condition, and DB session lifecycle are written up in [Engineering Decisions](#engineering-decisions) below.                                                                                                                    | ✅      |
-
-### Out of scope (by request)
-
-Hard Mode (Слой 7: `GET /api/documents/{id}/status` with `Retry-After`, and the idempotency check for
-duplicate in-flight `POST`s) was intentionally left out of this pass.
-
-### Follow-up iterations (beyond the original ticket)
-
-Shipped after the initial async-processing ticket, in later commits:
-
-- Content deduplication via SHA-256 `content_hash`, with per-document `chunking_time_ms` / `embedding_time_ms` /
-  `total_processing_time_ms` metrics added in the same migration.
-- A `UNIQUE` constraint on `documents.content_hash` (`add_unique_constraint_to_content_hash`), closing the
-  application-level dedup check's race window, paired with `IntegrityError` handling in `create_document()`.
-- Redis-backed search result caching with `X-Cache` headers and completion-triggered invalidation.
-- Request-id tagging and per-request latency logging (`X-Request-ID`, `X-Response-Time`) via
-  `ProfilerAndExceptionMiddleware`.
-- `/system/live` and `/system/ready` liveness/readiness probes (database, Redis, embedding model checks), wired
-  into `docker-compose.yml`'s `app` healthcheck.
-- Duplicate HNSW index removed (`ab8ab01e1746` had created it once; a later migration branch created a second
-  one, cleaned up via `c1698571fb87` + a merge migration).
-- Free-form JSON `metadata` on documents (`add_metadata_to_documents`, `JSONB` column), accepted on create and
-  returned on detail/search reads — see [Document Metadata](#document-metadata) for the alias wiring and the
-  current test-coverage gap.
-
-### Smaller things worth a look
-
-- `process_document_background` opens its session via `closing(next(get_db()))`. This calls `.close()` on exit but
-  never resumes the `get_db()` generator past its `yield`, so `get_db()`'s own `try/commit`/`except/rollback`
-  logic never executes for this path — the function compensates by calling `db.commit()` / `db.rollback()` itself
-  explicitly, which works correctly, but it's a slightly unusual use of the dependency generator. Left as-is since
-  it's functionally correct; worth a comment if it trips someone up later.
-- `check_database()` in `app/api/system.py` uses the same `closing(next(get_db()))` pattern as background
-  processing, for the same reason — it needs a session outside of FastAPI's request-scoped `Depends(get_db)`.
 
 ---
 

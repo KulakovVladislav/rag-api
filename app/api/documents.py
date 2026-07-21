@@ -7,6 +7,7 @@ from fastapi.responses import JSONResponse
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
+from app.core.context import request_id_ctx
 from app.database.db import get_db
 from app.database.models import Document
 from app.schemas import DocumentCreate, DocumentResponse, DocumentDetail
@@ -67,9 +68,15 @@ async def create_document(
 
     db.refresh(db_document)
 
+    try:
+        current_request_id = request_id_ctx.get()
+    except LookupError:
+        current_request_id = ""
+
     background_tasks.add_task(
         process_document_background,
         document_id=db_document.id,
+        request_id=current_request_id,
         content=cleaned_content
     )
 

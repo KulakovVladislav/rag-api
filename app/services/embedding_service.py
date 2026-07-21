@@ -5,9 +5,8 @@ from starlette.concurrency import run_in_threadpool
 
 model = SentenceTransformer(
     "sentence-transformers/all-MiniLM-L6-v2",
-    cache_folder=os.getenv("HF_HOME", "/app/.hf_cache")
+    cache_folder=os.getenv("HF_HOME", "./.hf_cache")
 )
-
 
 def generate_embeddings_sync(texts: list[str]):
     embeddings = model.encode(texts)

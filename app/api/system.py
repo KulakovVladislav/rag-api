@@ -1,12 +1,11 @@
 import logging
-from contextlib import closing
 
 from fastapi import APIRouter, Response
 from sqlalchemy import text
 from starlette import status
 
 from app.core.redis import get_redis_client
-from app.database.db import get_db
+from app.database.db import get_db_context
 from app.schemas import ReadinessResponse
 from app.services.embedding_service import get_embedding
 
@@ -16,7 +15,7 @@ router = APIRouter()
 
 def check_database() -> str:
     try:
-        with closing(next(get_db())) as db:
+        with get_db_context() as db:
             db.execute(text("SELECT 1"))
         return "ok"
     except Exception as e:

@@ -1,7 +1,45 @@
+import asyncio
+import json
+import logging
+import uuid
 from unittest.mock import AsyncMock, patch
 
+
+def test_failed_processing_log_contains_error(caplog):
+    content = f"This will fail during embedding. {uuid.uuid4()}"
+
+    with caplog.at_level(logging.ERROR, logger="app.services.document_service"):
+        with patch(
+                "app.services.document_service.get_embeddings",
+                side_effect=Exception("embedding model crashed"),
+        ):
+            response = client.post(
+                "/api/documents",
+                json={
+                    "title": "Failing Log Doc",
+                    "content": content,
+                },
+            )
+
+    assert response.status_code == 202
+
+    failed_records = [
+        record
+        for record in caplog.records
+        if record.name == "app.services.document_service"
+           and record.getMessage() == "document_processing_failed"
+    ]
+
+    assert failed_records
+    assert failed_records[-1].error == "embedding model crashed"
+
+
+import pytest
 from fastapi.testclient import TestClient
 
+from app.core.logging import JsonProfileFormatter, RequestFilter
+from app.database.db import get_db_context
+from app.database.models import Document
 from app.main import app
 from app.services import document_service
 
@@ -37,13 +75,14 @@ def test_get_document_after_processing_returns_completed_with_chunk_count():
 
 
 def test_failed_processing_sets_status_failed():
+    unique_content = f"This will fail during embedding {uuid.uuid4()}"
     with patch(
             "app.services.document_service.get_embeddings",
             side_effect=Exception("embedding model crashed"),
     ):
         response = client.post(
             "/api/documents",
-            json={"title": "Doomed Doc", "content": "This will fail during embedding."},
+            json={"title": "Doomed Doc", "content": unique_content},
         )
     doc_id = response.json()["id"]
 
@@ -368,24 +407,18 @@ def test_document_fields_and_latency_lifecycle():
     assert completed_detail["total_processing_time_ms"] is not None
     assert completed_detail["total_processing_time_ms"] > 0
 
-    expected_total = completed_detail["chunking_time_ms"] + completed_detail["embedding_time_ms"]
-    assert completed_detail["total_processing_time_ms"] == expected_total
+    expected_total = (
+            completed_detail["chunking_time_ms"]
+            + completed_detail["embedding_time_ms"]
+    )
+
+    assert completed_detail["total_processing_time_ms"] == pytest.approx(
+        expected_total,
+        abs=1.0,
+    )
 
 
 def test_content_hash_unique_constraint_returns_409_on_race():
-    """
-    Simulates two near-simultaneous identical POSTs both passing the application-level
-    get_document_by_hash() pre-check (because neither has committed yet when the other
-    checks). get_document_by_hash is mocked to return None for the first two calls —
-    the pre-check on request 1 and the pre-check on request 2 — so both requests reach
-    db.commit(). The first commit succeeds and creates the row. The second commit hits
-    the real UNIQUE constraint on documents.content_hash (added in
-    add_unique_constraint_to_content_hash) and raises IntegrityError, which
-    create_document() catches, rolls back, and turns into a 409 — using a *real*
-    (unmocked) get_document_by_hash() call to resolve existing_document_id, which is why
-    the mock only forces None for the first two calls and falls through to the real
-    function afterwards.
-    """
     content = "Race condition content for unique constraint test."
 
     real_get_document_by_hash = document_service.get_document_by_hash
@@ -555,3 +588,134 @@ def test_create_document_invalid_metadata_type_returns_422():
         }
     )
     assert response.status_code == 422
+
+
+def test_json_formatter_emits_valid_json_with_required_fields():
+    logger = logging.getLogger("test_json_formatter")
+    logger.setLevel(logging.INFO)
+    logger.propagate = False
+
+    records = []
+
+    class ListHandler(logging.Handler):
+        def emit(self, record):
+            records.append(self.format(record))
+
+    handler = ListHandler()
+    handler.setFormatter(JsonProfileFormatter())
+    handler.addFilter(RequestFilter())
+    logger.handlers = [handler]
+
+    logger.info(
+        "document_processing_completed",
+        extra={"document_id": 7, "request_id": "req-json-test", "chunk_count": 4},
+    )
+
+    parsed = json.loads(records[0])
+    for field in ("timestamp", "level", "logger_name", "message", "request_id"):
+        assert field in parsed
+    assert parsed["level"] == "INFO"
+    assert parsed["logger_name"] == "test_json_formatter"
+    assert parsed["message"] == "document_processing_completed"
+    assert parsed["request_id"] == "req-json-test"
+    assert parsed["document_id"] == 7
+    assert parsed["chunk_count"] == 4
+
+
+def test_background_task_log_request_id_matches_response_header(caplog):
+    with caplog.at_level(logging.INFO, logger="app.services.document_service"):
+        response = client.post(
+            "/api/documents",
+            json={"title": "RequestId Match Doc", "content": "Content to check request id propagation."},
+        )
+    assert response.status_code == 202
+    response_request_id = response.headers["X-Request-ID"]
+
+    completed_records = [
+        r for r in caplog.records
+        if r.name == "app.services.document_service"
+           and r.getMessage() == "document_processing_completed"
+    ]
+    assert len(completed_records) > 0
+    assert completed_records[-1].request_id == response_request_id
+
+
+def test_failed_processing_log_contains_error(caplog):
+    with caplog.at_level(logging.ERROR, logger="app.services.document_service"):
+        with patch(
+                "app.services.document_service.get_embeddings",
+                side_effect=Exception("embedding model crashed"),
+        ):
+            client.post(
+                "/api/documents",
+                json={"title": "Failing Log Doc", "content": "This will fail during embedding."},
+            )
+
+    failed_records = [
+        r for r in caplog.records
+        if r.name == "app.services.document_service"
+           and r.getMessage() == "document_processing_failed"
+    ]
+    assert len(failed_records) > 0
+    assert failed_records[-1].error == "embedding model crashed"
+
+
+def test_get_db_context_commits_and_closes_session():
+    with get_db_context() as db:
+        doc = Document(
+            title="Context Manager Commit Doc",
+            content="Verifying get_db_context commits.",
+            content_hash="ctxmgr-commit-hash-unique",
+            status="completed",
+        )
+        db.add(doc)
+        db.flush()
+        doc_id = doc.id
+
+    assert db.get_transaction() is None
+
+    with get_db_context() as verify_db:
+        found = verify_db.query(Document).filter(Document.id == doc_id).first()
+        assert found is not None
+        assert found.content_hash == "ctxmgr-commit-hash-unique"
+
+
+def test_get_db_context_rolls_back_and_closes_on_exception():
+    doc_id = None
+    with pytest.raises(ValueError):
+        with get_db_context() as db:
+            doc = Document(
+                title="Context Manager Rollback Doc",
+                content="Verifying get_db_context rolls back.",
+                content_hash="ctxmgr-rollback-hash-unique",
+                status="completed",
+            )
+            db.add(doc)
+            db.flush()
+            doc_id = doc.id
+            raise ValueError("simulated failure inside context")
+
+    with get_db_context() as verify_db:
+        found = verify_db.query(Document).filter(Document.id == doc_id).first()
+        assert found is None  # rolled back, never committed
+
+
+def test_populate_rag_creates_completed_documents_visible_in_search():
+    from scripts.populate_rag import main as populate_main
+
+    asyncio.run(populate_main())
+
+    response = client.get("/api/search", params={"q": "doc_token_1"})
+    assert response.status_code == 200
+    results = response.json()
+    matching = [r for r in results if "doc_token_1" in r["content"]]
+    assert len(matching) > 0
+
+    doc_id = None
+    for doc in client.get("/api/documents", params={"limit": 100}).json():
+        detail = client.get(f"/api/documents/{doc['id']}").json()
+        if "doc_token_1" in detail.get("content", ""):
+            doc_id = doc["id"]
+            break
+    assert doc_id is not None
+    assert client.get(f"/api/documents/{doc_id}").json()["status"] == "completed"
