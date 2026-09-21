@@ -697,7 +697,7 @@ def test_get_db_context_rolls_back_and_closes_on_exception():
 
     with get_db_context() as verify_db:
         found = verify_db.query(Document).filter(Document.id == doc_id).first()
-        assert found is None  # rolled back, never committed
+        assert found is None
 
 
 def test_populate_rag_creates_completed_documents_visible_in_search():
@@ -719,3 +719,9 @@ def test_populate_rag_creates_completed_documents_visible_in_search():
             break
     assert doc_id is not None
     assert client.get(f"/api/documents/{doc_id}").json()["status"] == "completed"
+
+
+def test_if_min_length_works():
+    small_phrase = "h"
+    response = client.get("/api/search", params={"q": small_phrase})
+    assert response.status_code == 422

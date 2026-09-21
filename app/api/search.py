@@ -1,7 +1,9 @@
 import hashlib
 import json
+from typing import Annotated
 
 from fastapi import APIRouter, Depends, Response
+from fastapi import Query
 from sqlalchemy.orm import Session
 
 from app.config import settings
@@ -18,7 +20,7 @@ router = APIRouter()
 @router.get("", response_model=list[SearchResult])
 async def search(
         response: Response,
-        q: str,
+        q: Annotated[str, Query(min_length=2)],
         top_k: int = 5,
         db: Session = Depends(get_db)
 ):
