@@ -18,45 +18,47 @@ class ProfilerAndExceptionMiddleware(BaseHTTPMiddleware):
 
         start_time = time.perf_counter()
         token = request_id_ctx.set(request_id)
+
         try:
-            response: Response = await call_next(request)
+            try:
+                response: Response = await call_next(request)
+            except Exception as exc:
+                stack_trace = traceback.format_exc()
+                logger.error(f"[UNEXPECTED ERROR] {exc}\n{stack_trace}")
 
-        except Exception as exc:
-            stack_trace = traceback.format_exc()
-            logger.error(f"[UNEXPECTED ERROR] {exc}\n{stack_trace}")
+                response = JSONResponse(
+                    status_code=500,
+                    content={
+                        "detail": "Internal Server Error",
+                        "request_id": request_id,
+                    }
+                )
 
-            response = JSONResponse(
-                status_code=500,
-                content={
-                    "detail": "Internal Server Error",
+            process_time = (time.perf_counter() - start_time) * 1000
+            latency_str = f"{process_time:.2f}ms"
+
+            response.headers["X-Response-Time"] = latency_str
+            response.headers["X-Request-ID"] = request_id
+
+            logger.info(
+                "request_completed",
+                extra={
+                    "event": "request_completed",
                     "request_id": request_id,
+                    "method": request.method,
+                    "path": str(request.url.path),
+                    "status_code": response.status_code,
+                    "duration_ms": round(process_time, 2)
                 }
             )
+
+            return response
 
         finally:
             try:
                 request_id_ctx.reset(token)
             except Exception:
                 pass
-
-        process_time = (time.perf_counter() - start_time) * 1000
-        latency_str = f"{process_time:.2f}ms"
-
-        response.headers["X-Response-Time"] = latency_str
-        response.headers["X-Request-ID"] = request_id
-
-        logger.info(
-            "request_completed",
-            extra={
-                "event": "request_completed",
-                "method": request.method,
-                "path": str(request.url.path),
-                "status_code": response.status_code,
-                "duration_ms": round(process_time, 2)
-            }
-        )
-
-        return response
 
 
 def register_middlewares(app: FastAPI) -> None:

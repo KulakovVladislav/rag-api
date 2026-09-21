@@ -8,10 +8,6 @@ from app.core.context import request_id_ctx
 
 class RequestFilter(logging.Filter):
     def filter(self, record):
-        # Don't clobber a request_id passed explicitly via extra={} (e.g.
-        # process_document_background, which runs after the middleware's
-        # ContextVar token has already been reset — request_id_ctx.get()
-        # would raise LookupError there).
         if "request_id" not in record.__dict__:
             try:
                 record.request_id = request_id_ctx.get()
@@ -20,8 +16,6 @@ class RequestFilter(logging.Filter):
         return True
 
 
-# Standard LogRecord attributes — anything else on the record was passed
-# via extra={} and should be folded into the JSON output.
 _RESERVED_RECORD_ATTRS = {
     "name", "msg", "args", "levelname", "levelno", "pathname", "filename",
     "module", "exc_info", "exc_text", "stack_info", "lineno", "funcName",

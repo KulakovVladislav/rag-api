@@ -8,6 +8,7 @@ model = SentenceTransformer(
     cache_folder=os.getenv("HF_HOME", "./.hf_cache")
 )
 
+
 def generate_embeddings_sync(texts: list[str]):
     embeddings = model.encode(texts)
     embeddings_list = embeddings.tolist()

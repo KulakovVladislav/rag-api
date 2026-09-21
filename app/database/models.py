@@ -12,10 +12,6 @@ class Document(Base):
     id = Column(Integer, primary_key=True, index=True)
     title = Column(String, nullable=False)
     content = Column(Text, nullable=False)
-    # server_default='completed' applies only during raw SQL INSERT without explicit column specification
-    # (for example, during a backfill in an Alembic migration). SQLAlchemy ORM always passes default='processing'
-    # explicitly in the INSERT when creating a new Document via the ORM — therefore, server_default
-    # during normal usage is unreachable, it only acts as a fallback for direct SQL inserts that bypass the ORM.
     status = Column(String(20), server_default='completed', default='processing')
 
     content_hash = Column(String(64), nullable=False)
