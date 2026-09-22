@@ -1,7 +1,9 @@
 import hashlib
 import json
+import logging
 from typing import Annotated
 
+import redis
 from fastapi import APIRouter, Depends, Response
 from fastapi import Query
 from sqlalchemy.orm import Session
@@ -15,6 +17,7 @@ from app.services.embedding_service import get_embedding
 from app.services.search_service import calculate_cosine_score
 
 router = APIRouter()
+logger = logging.getLogger("redis_status")
 
 
 @router.get("", response_model=list[SearchResult])
@@ -29,12 +32,18 @@ async def search(
 
     redis_client = get_redis_client()
 
-    cached_data = redis_client.get(cache_key)
-    if cached_data:
-        response.headers["X-Cache"] = "HIT"
-        return json.loads(cached_data)
-
-    response.headers["X-Cache"] = "MISS"
+    try:
+        cached_data = redis_client.get(cache_key)
+        if cached_data:
+            logger.info("cache_status", extra={"status": "HIT", "cache_key": cache_key})
+            response.headers["X-Cache"] = "HIT"
+            return json.loads(cached_data)
+    except redis.exceptions.ConnectionError as e:
+        logger.error("cache_status", extra={"status": "READ_FAILED", "cache_key": cache_key})
+        response.headers["X-Cache"] = "MISS"
+    else:
+        logger.info("cache_status", extra={"status": "MISS", "cache_key": cache_key})
+        response.headers["X-Cache"] = "MISS"
 
     vector = await get_embedding(q)
     distance = Chunk.embedding.cosine_distance(vector)
@@ -58,10 +67,16 @@ async def search(
         for row in results
     ]
 
-    redis_client.set(
-        cache_key,
-        json.dumps(formatted_results, ensure_ascii=False),
-        ex=settings.search_cache_ttl
-    )
+    try:
+        redis_client.set(
+            cache_key,
+            json.dumps(formatted_results, ensure_ascii=False),
+            ex=settings.search_cache_ttl
+        )
+
+
+    except (redis.exceptions.ConnectionError, redis.exceptions.TimeoutError):
+        logger.warning("cache_status", extra={"status": "WRITE_FAILED", "cache_key": cache_key})
+        pass
 
     return formatted_results
