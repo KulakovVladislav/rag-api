@@ -4,6 +4,8 @@ import logging
 import uuid
 from unittest.mock import AsyncMock, patch
 
+import redis.exceptions
+
 
 def test_failed_processing_log_contains_error(caplog):
     content = f"This will fail during embedding. {uuid.uuid4()}"
@@ -725,3 +727,18 @@ def test_if_min_length_works():
     small_phrase = "h"
     response = client.get("/api/search", params={"q": small_phrase})
     assert response.status_code == 422
+
+
+def test_search_handles_redis_unavailable(caplog):
+    unique_phrase = "cache hit unique marker phrase alpha"
+    client.post(
+        "/api/documents",
+        json={"title": "Cache Hit Doc", "content": unique_phrase},
+    )
+    with patch("app.api.search.get_redis_client") as mock_get_client:
+        with caplog.at_level(logging.ERROR, logger="redis_status"):
+            mock_get_client.return_value.get.side_effect = redis.exceptions.ConnectionError
+            first_response = client.get("/api/search", params={"q": unique_phrase, "top_k": 3})
+            assert first_response.status_code == 200
+            assert first_response.headers["X-Cache"] == "MISS"
+            assert any(record.cache_status == "READ_FAILED" for record in caplog.records)

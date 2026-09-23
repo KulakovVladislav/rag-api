@@ -35,14 +35,14 @@ async def search(
     try:
         cached_data = redis_client.get(cache_key)
         if cached_data:
-            logger.info("cache_status", extra={"status": "HIT", "cache_key": cache_key})
+            logger.info("cache_status", extra={"cache_status": "HIT", "cache_key": cache_key})
             response.headers["X-Cache"] = "HIT"
             return json.loads(cached_data)
     except redis.exceptions.ConnectionError as e:
-        logger.error("cache_status", extra={"status": "READ_FAILED", "cache_key": cache_key})
+        logger.error("cache_status", extra={"cache_status": "READ_FAILED", "cache_key": cache_key})
         response.headers["X-Cache"] = "MISS"
     else:
-        logger.info("cache_status", extra={"status": "MISS", "cache_key": cache_key})
+        logger.info("cache_status", extra={"cache_status": "MISS", "cache_key": cache_key})
         response.headers["X-Cache"] = "MISS"
 
     vector = await get_embedding(q)
@@ -76,7 +76,7 @@ async def search(
 
 
     except (redis.exceptions.ConnectionError, redis.exceptions.TimeoutError):
-        logger.warning("cache_status", extra={"status": "WRITE_FAILED", "cache_key": cache_key})
+        logger.warning("cache_status", extra={"cache_status": "WRITE_FAILED", "cache_key": cache_key})
         pass
 
     return formatted_results
