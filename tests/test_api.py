@@ -741,4 +741,4 @@ def test_search_handles_redis_unavailable(caplog):
             first_response = client.get("/api/search", params={"q": unique_phrase, "top_k": 3})
             assert first_response.status_code == 200
             assert first_response.headers["X-Cache"] == "MISS"
-            assert any(record.cache_status == "READ_FAILED" for record in caplog.records)
+            assert any(getattr(record, "cache_status", None) == "READ_FAILED" for record in caplog.records)
