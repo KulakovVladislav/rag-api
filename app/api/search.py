@@ -7,6 +7,7 @@ import redis
 from fastapi import APIRouter, Depends, Response
 from fastapi import Query
 from sqlalchemy.orm import Session
+from starlette.concurrency import run_in_threadpool
 
 from app.config import settings
 from app.core.redis import get_redis_client
@@ -33,7 +34,7 @@ async def search(
     redis_client = get_redis_client()
 
     try:
-        cached_data = redis_client.get(cache_key)
+        cached_data = await run_in_threadpool(redis_client.get, cache_key)
         if cached_data:
             logger.info("cache_status", extra={"cache_status": "HIT", "cache_key": cache_key})
             response.headers["X-Cache"] = "HIT"
@@ -47,13 +48,15 @@ async def search(
 
     vector = await get_embedding(q)
     distance = Chunk.embedding.cosine_distance(vector)
-    results = (
-        db.query(Chunk, Document.title, Document.doc_metadata, distance.label("distance"))
-        .join(Document, Chunk.document_id == Document.id)
-        .filter(Document.status == "completed")
-        .order_by(distance)
-        .limit(top_k)
-        .all()
+    results = await run_in_threadpool(
+        lambda: (
+            db.query(Chunk, Document.title, Document.doc_metadata, distance.label("distance"))
+            .join(Document, Chunk.document_id == Document.id)
+            .filter(Document.status == "completed")
+            .order_by(distance)
+            .limit(top_k)
+            .all()
+        )
     )
 
     formatted_results = [

@@ -1,10 +1,14 @@
 import asyncio
 import json
 import logging
+import time
 import uuid
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock
+from unittest.mock import patch
 
+import pytest
 import redis.exceptions
+from starlette.concurrency import run_in_threadpool
 
 
 def test_failed_processing_log_contains_error(caplog):
@@ -36,7 +40,6 @@ def test_failed_processing_log_contains_error(caplog):
     assert failed_records[-1].error == "embedding model crashed"
 
 
-import pytest
 from fastapi.testclient import TestClient
 
 from app.core.logging import JsonProfileFormatter, RequestFilter
@@ -774,3 +777,27 @@ def test_search_handles_redis_miss(caplog):
         assert response.status_code == 200
         assert response.headers["X-Cache"] == "MISS"
         assert any(getattr(record, "cache_status", None) == "MISS" for record in caplog.records)
+
+
+@pytest.mark.asyncio
+async def test_sqlalchemy_does_not_block_event_loop():
+    call_timestamps = {}
+
+    def slow_db_call(*args, **kwargs):
+        call_timestamps["search_start"] = time.time()
+        time.sleep(1)
+        call_timestamps["search_end"] = time.time()
+        return []
+
+    async def search():
+        return await run_in_threadpool(slow_db_call)
+
+    async def health_check():
+        await asyncio.sleep(0.1)
+        call_timestamps["health_start"] = time.time()
+
+    await asyncio.gather(search(), health_check())
+
+    assert call_timestamps["health_start"] < call_timestamps["search_end"], (
+        "The event loop was blocked by the synchronous database operation"
+    )

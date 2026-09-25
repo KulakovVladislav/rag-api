@@ -11,3 +11,4 @@ pgvector==0.4.2
 pytest==9.0.3
 fakeredis==2.36.1
 httpx2==2.4.0
+pytest-asyncio==1.4.0a2
