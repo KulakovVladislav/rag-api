@@ -220,6 +220,15 @@ We will use a **Hybrid Isolation Strategy**:
 Both fakes will implement synchronous `time.sleep()` to rigorously simulate the blocking behavior of real networking
 drivers, verifying that `run_in_threadpool` prevents Event Loop degradation.
 
+Additionally, our execution mechanics dictate that:
+
+* The factory method `get_redis_client` is mocked at the function level rather than an object instance to accommodate
+  runtime evaluation in the route body.
+* The `get_embedding` helper method is also systematically intercepted and stubbed to avoid hitting third-party vector
+  dependencies during execution.
+* A base delay of 1.0s alongside an overall test threshold of 4.0s are established via negative control metrics
+  (verifying async threadpool concurrency at 3.1s versus sequential block failure scaling to 5.03s).
+
 ## Trade-offs of the Hybrid Approach
 
 ### Pros

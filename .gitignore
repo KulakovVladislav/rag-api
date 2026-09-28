@@ -33,3 +33,4 @@ project_context.txt
 *.zip
 .DS_Store
 **/.DS_Store
+.DS_Store
