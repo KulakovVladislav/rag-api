@@ -196,3 +196,45 @@ The architectural requirement is therefore:
 
 > Synchronous I/O or CPU-bound operations must not be executed directly inside an `async def` request handler when they
 > can block the event-loop thread.
+
+# Architectural Decision Record: Testing Concurrency and Latency with Module-Level Imports
+
+## Context
+
+Our FastAPI RAG application isolates slow synchronous I/O operations (Database queries and Redis caching) using
+Starlette's `run_in_threadpool`. To ensure that these operations run asynchronously in background threads and do not
+freeze the main Event Loop, we need automated concurrency testing with injected latency.
+
+However, while the database session (`db`) is injected per-request using FastAPI's `Depends`, the `redis_client` is
+initialized globally at the module level (`app/api/search.py`) via `redis.from_url(...)` and imported directly. This
+prevents us from using FastAPI's native `app.dependency_overrides` for Redis.
+
+## Decision
+
+We will use a **Hybrid Isolation Strategy**:
+
+1. **Database:** Standard `app.dependency_overrides` to inject a simulated `FakeSlowDatabase`.
+2. **Redis:** Module-level mocking using `unittest.mock.patch` (or pytest's `monkeypatch`) targeting the specific import
+   path `app.api.search.redis_client`.
+
+Both fakes will implement synchronous `time.sleep()` to rigorously simulate the blocking behavior of real networking
+drivers, verifying that `run_in_threadpool` prevents Event Loop degradation.
+
+## Trade-offs of the Hybrid Approach
+
+### Pros
+
+* **Complete Test Coverage:** Safely validates both the DB thread scheduling and Redis thread scheduling inside the
+  actual HTTP endpoint pipeline.
+* **Zero Production Code Changes:** We do not need to rewrite stable production code or force `Depends(get_redis)` onto
+  the codebase solely to satisfy a test framework.
+* **High Controllability:** Synchronous `time.sleep()` within the isolated thread mimics real network lag perfectly
+  without breaking the test runner's execution queue.
+
+### Cons
+
+* **Brittle Import Paths:** Using `mock.patch` requires hardcoding the exact string path where `redis_client` is
+  consumed (`app.api.search.redis_client`). If the file structure or internal imports change, the test will silently
+  fail to intercept the client.
+* **Global State Risks:** Modifying module-level attributes can pollute other tests if the patch is not carefully torn
+  down or scoped properly within pytest fixtures.

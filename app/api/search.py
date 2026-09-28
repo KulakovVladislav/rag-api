@@ -71,7 +71,8 @@ async def search(
     ]
 
     try:
-        redis_client.set(
+        await run_in_threadpool(
+            redis_client.set,
             cache_key,
             json.dumps(formatted_results, ensure_ascii=False),
             ex=settings.search_cache_ttl

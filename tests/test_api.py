@@ -6,9 +6,18 @@ import uuid
 from unittest.mock import AsyncMock
 from unittest.mock import patch
 
+import httpx
 import pytest
 import redis.exceptions
-from starlette.concurrency import run_in_threadpool
+from fastapi.testclient import TestClient
+
+from app.core.logging import JsonProfileFormatter, RequestFilter
+from app.database.db import get_db_context, get_db
+from app.database.models import Document
+from app.main import app
+from app.services import document_service
+
+client = TestClient(app)
 
 
 def test_failed_processing_log_contains_error(caplog):
@@ -38,17 +47,6 @@ def test_failed_processing_log_contains_error(caplog):
 
     assert failed_records
     assert failed_records[-1].error == "embedding model crashed"
-
-
-from fastapi.testclient import TestClient
-
-from app.core.logging import JsonProfileFormatter, RequestFilter
-from app.database.db import get_db_context
-from app.database.models import Document
-from app.main import app
-from app.services import document_service
-
-client = TestClient(app)
 
 
 def test_post_document_returns_202_processing():
@@ -779,25 +777,53 @@ def test_search_handles_redis_miss(caplog):
         assert any(getattr(record, "cache_status", None) == "MISS" for record in caplog.records)
 
 
-@pytest.mark.asyncio
-async def test_sqlalchemy_does_not_block_event_loop():
-    call_timestamps = {}
+class FakeSlowDatabase:
+    def query(self, *args, **kwargs): return self
 
-    def slow_db_call(*args, **kwargs):
-        call_timestamps["search_start"] = time.time()
+    def join(self, *args, **kwargs): return self
+
+    def filter(self, *args, **kwargs): return self
+
+    def order_by(self, *args, **kwargs): return self
+
+    def limit(self, *args, **kwargs): return self
+
+    def all(self):
         time.sleep(1)
-        call_timestamps["search_end"] = time.time()
         return []
 
-    async def search():
-        return await run_in_threadpool(slow_db_call)
 
-    async def health_check():
-        await asyncio.sleep(0.1)
-        call_timestamps["health_start"] = time.time()
+class FakeSlowRedis:
+    def get(self, key: str):
+        time.sleep(1)
+        return None
 
-    await asyncio.gather(search(), health_check())
+    def set(self, key: str, value: str, ex: int = None):
+        time.sleep(1)
+        return True
 
-    assert call_timestamps["health_start"] < call_timestamps["search_end"], (
-        "The event loop was blocked by the synchronous database operation"
-    )
+
+async def fake_get_embedding(text):
+    return [1, 2, 3, 4]
+
+
+@pytest.fixture
+def slow_fakes(monkeypatch):
+    app.dependency_overrides[get_db] = FakeSlowDatabase
+    monkeypatch.setattr("app.api.search.get_redis_client", lambda: FakeSlowRedis())
+    monkeypatch.setattr("app.api.search.get_embedding", fake_get_embedding)
+    yield
+    app.dependency_overrides.clear()
+
+
+@pytest.mark.asyncio
+async def test_search_endpoint_does_not_block_event_loop(slow_fakes):
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
+        response_1 = client.get("/api/search", params={"q": "lewis_hamilton"})
+        response_2 = client.get("/api/search", params={"q": "michael_schumacher"})
+        response_3 = client.get("/api/search", params={"q": "kimi_antonelli"})
+        start = time.perf_counter()
+        responses = await asyncio.gather(response_1, response_2, response_3)
+        elapsed = time.perf_counter() - start
+        assert all(r.status_code == 200 for r in responses)
+        assert elapsed < 4, f"took {elapsed:.2f}s"
