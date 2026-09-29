@@ -25,10 +25,10 @@ in the background, so a 50-page document no longer ties up a Gunicorn worker for
 - [Project Structure](#project-structure)
 - [Getting Started](#getting-started)
 - [API Reference](#api-reference)
+    - [Search hardening](#search-hardening)
 - [Running Tests](#running-tests)
 - [Environment Variables](#environment-variables)
 - [Engineering Decisions](#engineering-decisions)
-- [Ticket Status](#ticket-status)
 
 ---
 
@@ -199,10 +199,10 @@ stays clean while the Python code underneath uses `doc_metadata` throughout.
 extended with the field. If you need to confirm what metadata was stored right after creating a document, fetch
 it via `GET /api/documents/{id}` rather than trusting the `202` body.
 
-**Not yet covered by tests.** `tests/test_api.py` has no test exercising `metadata` — not on create, not on the
-detail/search read paths, and not for what happens with the default `None` case. This is a real gap, not a
-formality: nothing currently guards against the alias wiring silently breaking (e.g. a future refactor swapping
-`Field(alias=...)` for something that doesn't round-trip through `populate_by_name`).
+**Covered by tests.** Four tests in `tests/test_api.py` exercise `metadata`: it is stored on create and read back
+via `GET /api/documents/{id}`, a document created without it returns `null`, it comes back on `GET /api/search`
+results, and a non-object value (e.g. a string) is rejected with `422`. The alias wiring (`Field(alias=...)` +
+`populate_by_name`) is therefore guarded against silent breakage.
 
 ---
 
@@ -220,6 +220,9 @@ formality: nothing currently guards against the alias wiring silently breaking (
 
 This trades a small amount of staleness (bounded by the TTL, and actively cleared on new content) for
 avoiding repeated embedding-model inference on hot queries.
+
+Redis is an optimisation, not a dependency of the search path: if it is unreachable, searches still succeed as
+cache misses. See [Search hardening](#search-hardening) for the exact behaviour and the `cache_status` log values.
 
 ---
 
@@ -327,7 +330,7 @@ never "is it working correctly".
 Readiness probe (response validated against the `ReadinessResponse` schema). Checks the three hard dependencies
 on every call:
 
-- **`database`** — opens a fresh session via `get_db()` and runs `SELECT 1`
+- **`database`** — opens a fresh session via `get_db_context()` and runs `SELECT 1`
 - **`redis`** — `PING`s the Redis client
 - **`embedding_model`** — runs a real embedding call (`get_embedding("healthcheck")`) through
   `sentence-transformers`, so a model that failed to load or a broken inference path is caught too, not just
@@ -393,7 +396,7 @@ rag-api/
 │   ├── config.py                 # Pydantic settings (DB, Redis, cache TTL)
 │   └── main.py                   # FastAPI app, router registration
 ├── alembic/                      # Database migrations (status, HNSW index, content_hash + metrics, unique constraint, metadata)
-├── tests/                        # Pytest test suite (40 tests)
+├── tests/                        # Pytest test suite (44 tests)
 ├── docker-compose.yml            # Production stack (app + Postgres/pgvector + Redis + Nginx)
 ├── docker-compose.test.yml       # Isolated test stack (Postgres + Redis containers)
 ├── Dockerfile                    # Multi-stage, non-root
@@ -524,7 +527,7 @@ header.
 
 | Parameter | Type    | Default  | Description                 |
 |-----------|---------|----------|-----------------------------|
-| `q`       | string  | required | Search query                |
+| `q`       | string  | required | Search query, min. 2 chars  |
 | `top_k`   | integer | `5`      | Number of results to return |
 
 **Response `200`**
@@ -547,7 +550,94 @@ header.
 > `metadata` here is the *parent document's* metadata, carried through the `Chunk`↔`Document` join — every chunk
 > from the same document repeats the same `metadata`, it isn't per-chunk.
 
-> Lower score = higher similarity (cosine distance).
+> `score` is `1 - cosine_distance` (see `calculate_cosine_score` in `app/services/search_service.py`) — **higher
+> score = higher similarity**. Results are ordered by ascending cosine distance from pgvector, which is the same
+> as descending `score`, so the first result in the response is always the best match.
+
+#### Search hardening
+
+Four guarantees on `GET /api/search`, each backed by code and a test.
+
+**1. Input validation — `q` needs at least 2 characters.** `q` is declared as `Query(min_length=2)`. A shorter
+value never reaches the handler (no embedding, no Redis, no DB): the client gets `422` with FastAPI's standard
+validation body. Real response for `GET /api/search?q=h`:
+
+```http
+HTTP/1.1 422 Unprocessable Entity
+content-type: application/json
+
+{"detail":[{"type":"string_too_short","loc":["query","q"],"msg":"String should have at least 2 characters","input":"h","ctx":{"min_length":2}}]}
+```
+
+An empty `q=` gives the same `string_too_short` error (`"input":""`); an omitted `q` gives
+`{"type":"missing","loc":["query","q"],"msg":"Field required"}`. Both are also `422`. Note the shape: this is
+FastAPI's `detail` list, not the catch-all exception handler's format, and there is no `X-Cache` header on it.
+Two-character queries such as `"ab"` are valid, so short abbreviations still work. Known limit: the length is
+checked on the raw string, so a query of two spaces (`q="  "`) passes validation. Test: `test_if_min_length_works`.
+
+**2. Redis is optional — a cache outage never fails a search.** Redis is touched twice per uncached request, and
+each touch is wrapped separately:
+
+- *Read fails* (`redis.exceptions.ConnectionError` on `get`) → the error is logged at `ERROR` as `READ_FAILED`, the
+  response gets `X-Cache: MISS`, and the request carries on exactly like a normal miss: embed the query, run the
+  pgvector query, return `200` with fresh results.
+- *Write fails* (`ConnectionError` or `TimeoutError` on `set`) → logged at `WARNING` as `WRITE_FAILED`, swallowed,
+  and the already-computed results are returned unchanged.
+
+With Redis fully down both happen in the same request: one `READ_FAILED` (`ERROR`) followed by one
+`WRITE_FAILED` (`WARNING`), same `request_id`, status `200`, `X-Cache: MISS`. Verified by running the real
+`search()` against a Redis client pointed at a closed port. Known gap: the read path catches only
+`ConnectionError`; a `TimeoutError` while reading is a separate exception class in `redis-py` and is not caught
+there, so it propagates to the catch-all exception middleware instead of degrading to a miss. Test:
+`test_search_handles_redis_unavailable`.
+
+**3. `cache_status` — one structured log record per cache outcome.** Emitted by `app/api/search.py` through the
+`redis_status` logger (message `cache_status`, extra fields `cache_status` and `cache_key`; `request_id` is added
+by the log filter). It is visible in the JSON stdout logs, e.g. filter on `"logger_name": "redis_status"`:
+
+| Value          | Level     | Meaning                                       | `X-Cache` header |
+|----------------|-----------|-----------------------------------------------|------------------|
+| `HIT`          | `INFO`    | Result served from Redis                      | `HIT`            |
+| `MISS`         | `INFO`    | Key not in Redis, computed from the database  | `MISS`           |
+| `READ_FAILED`  | `ERROR`   | Redis unreachable on `get`; treated as a miss | `MISS`           |
+| `WRITE_FAILED` | `WARNING` | Redis failed on `set`; result not cached      | `MISS`           |
+
+The header only distinguishes `HIT` from `MISS`; the two failure states exist only in the logs. Real records from
+a run with Redis down:
+
+```json
+{
+  "level": "ERROR",
+  "logger_name": "redis_status",
+  "message": "cache_status",
+  "request_id": "1d8786ed-47cc-43cf-97d2-b33986fbf764",
+  "cache_status": "READ_FAILED",
+  "cache_key": "search:query:2abf71b1f72c25e360a97be01dc70fc5"
+}
+{
+  "level": "WARNING",
+  "logger_name": "redis_status",
+  "message": "cache_status",
+  "request_id": "1d8786ed-47cc-43cf-97d2-b33986fbf764",
+  "cache_status": "WRITE_FAILED",
+  "cache_key": "search:query:2abf71b1f72c25e360a97be01dc70fc5"
+}
+```
+
+(`timestamp` field omitted for brevity.) `READ_FAILED` and `WRITE_FAILED` are separate so a log query tells you *which
+stage* of caching broke. Tests: `test_search_handles_redis_hit`, `test_search_handles_redis_miss`,
+`test_search_handles_redis_unavailable`.
+
+**4. Async-safe — the handler no longer blocks the event loop.** `search()` is `async def`, but `redis_client.get`,
+`redis_client.set` and the SQLAlchemy `db.query(...).all()` are synchronous (`redis-py` and a sync `Session`), so
+run directly they held the event-loop thread while waiting on Redis/PostgreSQL and stalled every other request on
+that worker. All three are now wrapped in `run_in_threadpool` (embedding was already, via `embedding_service.py`).
+Proof: `test_search_endpoint_does_not_block_event_loop` fires 3 concurrent requests against fakes that
+`time.sleep(1)` in `get`, in `set` and in the DB query (3 s per request) and asserts the whole batch finishes in
+under 4 s. Timings: about 3 s is what the threaded version should take, and about 9 s (3 requests × 3 s) is what
+it would take if every call blocked the loop — both are *calculated* from the fakes' `sleep` values, not
+measured. The *measured* negative control: with only `redis_client.set()` left unwrapped, the same test took
+5.03 s, above the 4 s threshold.
 
 ---
 
@@ -572,7 +662,7 @@ side effects.
 docker compose -f docker-compose.test.yml up --build --abort-on-container-exit
 ```
 
-40 tests cover:
+44 tests cover:
 
 - **Async lifecycle** — immediate `202`/`processing` response, `completed` status with correct `chunk_count` and
   populated `*_time_ms` fields once background processing finishes, a mocked-failure path landing on
@@ -583,6 +673,12 @@ docker compose -f docker-compose.test.yml up --build --abort-on-container-exit
   pre-check) is still caught by the database `UNIQUE` constraint and turned into a `409`.
 - **Search caching** — repeated identical queries return a cache hit, a new query is a cache miss, different
   `top_k` values produce different cache keys, and the cache is invalidated once a document finishes processing.
+- **Search hardening** — a 1-character `q` returns `422`; with Redis unavailable on read the search still returns
+  `200` with `X-Cache: MISS` and a `READ_FAILED` record; `HIT` and `MISS` records are emitted on the matching
+  paths; and three concurrent requests against artificially slow (`time.sleep`) Redis and DB fakes finish in
+  under 4 s, proving `search()` does not block the event loop.
+- **Document metadata** — stored on create and returned by `GET /api/documents/{id}`, `null` when omitted,
+  included in `GET /api/search` results, and a non-object value is rejected with `422`.
 - **Health checks** — `/system/live` always returns `200`; `/system/ready` returns `200` when database, Redis,
   and the embedding model all check out, and `503` if any single one (database or Redis) fails, with the
   per-check breakdown verified in both the healthy and unhealthy response bodies.
@@ -596,21 +692,18 @@ docker compose -f docker-compose.test.yml up --build --abort-on-container-exit
 - **`populate_rag.py`** — running the script against a clean database produces documents with
   `status="completed"` that are immediately visible in `GET /api/search`.
 
-**Not covered yet:** `metadata` (see [Document Metadata](#document-metadata)) — no test exercises setting it on
-create, reading it back via detail/search, or the default-`None` case.
-
 ---
 
 ## Environment Variables
 
 See `.env.example` for all required variables. The most relevant ones beyond standard Postgres/app settings:
 
-| Variable                             | Used by                               | Default                | Notes                                                                                                                                       |
-|--------------------------------------|---------------------------------------|------------------------|---------------------------------------------------------------------------------------------------------------------------------------------|
-| `REDIS_URL`                          | `app/config.py` → `redis_url`         | `redis://redis:6379/0` | Backs both search caching and cache invalidation.                                                                                           |
-| `SEARCH_CACHE_TTL`                   | `app/config.py` → `search_cache_ttl`  | `60` (seconds)         | Set directly in `.env.example`; override it in your own `.env` if you need a different TTL.                                                 |
-| `DATABASE_URL` / `TEST_DATABASE_URL` | `app/config.py`                       | — (required)           | Full SQLAlchemy connection strings; `TEST_DATABASE_URL` is used by the isolated test stack.                                                 |
-| `POSTGRES_HOST` / `POSTGRES_PORT`    | `app/config.py` → `db_host`/`db_port` | — (required)           | Read via `validation_alias`, independent of `DATABASE_URL`; used wherever the app needs the host/port pair directly rather than a full DSN. |
+| Variable                             | Used by                              | Default                                | Notes                                                                                       |
+|--------------------------------------|--------------------------------------|----------------------------------------|---------------------------------------------------------------------------------------------|
+| `REDIS_URL`                          | `app/config.py` → `redis_url`        | `redis://redis:6379/0`                 | Backs both search caching and cache invalidation.                                           |
+| `SEARCH_CACHE_TTL`                   | `app/config.py` → `search_cache_ttl` | `60` (seconds)                         | Set directly in `.env.example`; override it in your own `.env` if you need a different TTL. |
+| `DATABASE_URL` / `TEST_DATABASE_URL` | `app/config.py`                      | — (required)                           | Full SQLAlchemy connection strings; `TEST_DATABASE_URL` is used by the isolated test stack. |
+| `APP_TITLE`                          | `app/config.py` → `app_title`        | — (required, no default in `Settings`) | Used as the FastAPI app title (shown in Swagger UI at `/docs`).                             |
 
 ---
 
@@ -668,8 +761,10 @@ were committed, before the final `status="completed"` update lands).
 The `Depends(get_db)` session is scoped to the request lifecycle — by the time a `BackgroundTasks` callback runs,
 the request has already returned a response and that generator-based session is on its way to being torn down.
 Reusing it would mean operating on a session that may already be closed, mid-rollback, or being recycled by
-SQLAlchemy's pool for an unrelated request. The background function opens its own session via `get_db()`/
-`closing(...)`, independent of any request's lifecycle, and is responsible for its own `commit`/`rollback`.
+SQLAlchemy's pool for an unrelated request. The background function opens its own session via
+`get_db_context()` — a `@contextlib.contextmanager` (see [DB session handling](#observability)) — independent
+of any request's lifecycle, and is responsible for its own `commit`/`rollback`. An earlier version of this did
+`closing(next(get_db()))` instead; that pattern is gone.
 
 **A real `UNIQUE` constraint on top of the application-level dedup check**
 
