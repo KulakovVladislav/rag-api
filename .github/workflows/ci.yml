@@ -12,6 +12,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Copy env file from example
+        run: cp .env.example .env
+
       - name: Run tests
         run: |
           docker compose -f docker-compose.test.yml up --build --abort-on-container-exit
