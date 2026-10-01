@@ -19,7 +19,7 @@ venv/
 
 # Review artifacts
 review_output.txt
-project_context.txt
+
 # HuggingFace model cache
 .hf_cache/
 
@@ -28,9 +28,10 @@ alembic/__pycache__/
 alembic/versions/__pycache__/
 
 # Pytest
-.pytest_cache/project_context.txt
-project_context.txt
+.pytest_cache/
+
+# Archives
 *.zip
-.DS_Store
-**/.DS_Store
+
+# macOS
 .DS_Store
