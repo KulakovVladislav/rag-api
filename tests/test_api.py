@@ -20,35 +20,6 @@ from app.services import document_service
 client = TestClient(app)
 
 
-def test_failed_processing_log_contains_error(caplog):
-    content = f"This will fail during embedding. {uuid.uuid4()}"
-
-    with caplog.at_level(logging.ERROR, logger="app.services.document_service"):
-        with patch(
-                "app.services.document_service.get_embeddings",
-                side_effect=Exception("embedding model crashed"),
-        ):
-            response = client.post(
-                "/api/documents",
-                json={
-                    "title": "Failing Log Doc",
-                    "content": content,
-                },
-            )
-
-    assert response.status_code == 202
-
-    failed_records = [
-        record
-        for record in caplog.records
-        if record.name == "app.services.document_service"
-           and record.getMessage() == "document_processing_failed"
-    ]
-
-    assert failed_records
-    assert failed_records[-1].error == "embedding model crashed"
-
-
 def test_post_document_returns_202_processing():
     payload = {"title": "Valid Title", "content": "Valid Content"}
     response = client.post("/api/documents", json=payload)
@@ -644,22 +615,31 @@ def test_background_task_log_request_id_matches_response_header(caplog):
 
 
 def test_failed_processing_log_contains_error(caplog):
+    content = f"This will fail during embedding. {uuid.uuid4()}"
+
     with caplog.at_level(logging.ERROR, logger="app.services.document_service"):
         with patch(
                 "app.services.document_service.get_embeddings",
                 side_effect=Exception("embedding model crashed"),
         ):
-            client.post(
+            response = client.post(
                 "/api/documents",
-                json={"title": "Failing Log Doc", "content": "This will fail during embedding."},
+                json={
+                    "title": "Failing Log Doc",
+                    "content": content,
+                },
             )
 
+    assert response.status_code == 202
+
     failed_records = [
-        r for r in caplog.records
-        if r.name == "app.services.document_service"
-           and r.getMessage() == "document_processing_failed"
+        record
+        for record in caplog.records
+        if record.name == "app.services.document_service"
+           and record.getMessage() == "document_processing_failed"
     ]
-    assert len(failed_records) > 0
+
+    assert failed_records
     assert failed_records[-1].error == "embedding model crashed"
 
 
