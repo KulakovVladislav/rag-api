@@ -25,7 +25,7 @@ in the background, so a 50-page document no longer ties up a Gunicorn worker for
 - [Project Structure](#project-structure)
 - [Getting Started](#getting-started)
 - [API Reference](#api-reference)
-- [Search hardening](#search-hardening)
+    - [Search hardening](#search-hardening)
 - [Running Tests](#running-tests)
 - [Environment Variables](#environment-variables)
 - [Engineering Decisions](#engineering-decisions)
