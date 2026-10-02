@@ -725,6 +725,21 @@ def test_search_handles_redis_unavailable(caplog):
             assert any(getattr(record, "cache_status", None) == "READ_FAILED" for record in caplog.records)
 
 
+def test_search_handles_redis_timeout_error(caplog):
+    unique_phrase = "cache hit unique marker phrase alpha {uuid.uuid4()}"
+    client.post(
+        "/api/documents",
+        json={"title": "Cache Hit Doc", "content": unique_phrase},
+    )
+    with patch("app.api.search.get_redis_client") as mock_get_client:
+        with caplog.at_level(logging.ERROR, logger="redis_status"):
+            mock_get_client.return_value.get.side_effect = redis.exceptions.TimeoutError
+            response = client.get("/api/search", params={"q": unique_phrase, "top_k": 3})
+            assert response.status_code == 200
+            assert response.headers["X-Cache"] == "MISS"
+            assert any(getattr(record, "cache_status", None) == "READ_FAILED" for record in caplog.records)
+
+
 def test_search_handles_redis_hit(caplog):
     unique_phrase = "cache hit unique marker phrase alpha"
     client.post(

@@ -39,7 +39,7 @@ async def search(
             logger.info("cache_status", extra={"cache_status": "HIT", "cache_key": cache_key})
             response.headers["X-Cache"] = "HIT"
             return json.loads(cached_data)
-    except redis.exceptions.ConnectionError as e:
+    except (redis.exceptions.ConnectionError, redis.exceptions.TimeoutError):
         logger.error("cache_status", extra={"cache_status": "READ_FAILED", "cache_key": cache_key})
         response.headers["X-Cache"] = "MISS"
     else:

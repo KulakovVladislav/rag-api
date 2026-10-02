@@ -1,289 +1,215 @@
-# Search, Redis, Validation, and Event Loop Findings
+# Decisions
 
-## Query Validation
+The choices behind search, caching, testing, and CI — and what each one costs.
 
-Set `min_length=2` for the `q` query parameter.
+Every entry follows the same shape: **Context** (why it came up), **Options** (what we weighed), **Decision** (what we
+chose), **Cost** (what we accepted).
 
-**Reason:** This enforces a minimum level of meaningful input for semantic search. It prevents meaningless one-character
-queries while still allowing valid short abbreviations.
+## Contents
 
----
-
-## Redis Error Handling
-
-Catch `redis.exceptions.ConnectionError`.
-
-**Reason:** `ConnectionError` is specifically designed to handle failures caused by an unavailable or unexpectedly
-disconnected Redis service.
+- [Search](#search)
+- [Redis resilience](#redis-resilience)
+- [Concurrency](#concurrency)
+- [Testing](#testing)
+- [CI](#ci)
 
 ---
 
-## Cache Status Logging
+## Search
 
-Add a `cache_status` field to the `search()` logs.
+### Query validation
 
-### Field
+**Decision.** `q` requires at least 2 characters: `min_length=2`.
 
-`cache_status`
+**Why.** Semantic search needs a minimum of meaningful input. Two characters rule out one-character noise and still
+allow short abbreviations such as `ab`.
 
-### Possible values
+**Cost.** Length is checked on the raw string, so a query of two spaces passes.
 
-* `HIT` — cached result was successfully retrieved.
-* `MISS` — no cached result was found.
-* `READ_FAILED` — an error occurred while reading from Redis.
-* `WRITE_FAILED` — an error occurred while writing to Redis.
+### Write the cache after the database
 
-### Why Read and Write Failures Are Separated
+**Decision.** On a cache miss, read from the database, then store the result in Redis with `set()`.
 
-Separating `READ_FAILED` and `WRITE_FAILED` makes logs more informative and allows us to identify exactly which stage of
-the caching process failed. This makes debugging and monitoring easier.
+**Why.** The next identical request is served from the cache.
 
 ---
 
-## Cache Write After Database Query
+## Redis resilience
 
-If the requested result is not available in Redis, retrieve the data from the database and attempt to store the result
-in Redis using `set()`.
+Redis is an optimization, not a dependency. A cache outage must never fail a search.
 
-This allows subsequent identical search requests to be served from the cache.
+### 1. What the read path catches
+
+**Context.** The first version caught only `redis.exceptions.ConnectionError`, which covers an unavailable or
+disconnected Redis. A `TimeoutError` is a separate exception class in `redis-py`, so it escaped to the catch-all
+middleware and became a `500`. This decision supersedes the earlier `ConnectionError`-only choice.
+
+**Options.**
+
+| Option                            | Verdict                                                                                                      |
+|-----------------------------------|--------------------------------------------------------------------------------------------------------------|
+| `Exception`                       | Too broad. It would hide unrelated bugs — a `json.loads` failure, for example, would pass as a quiet `MISS`. |
+| `redis.exceptions.RedisError`     | Wider than necessary.                                                                                        |
+| `(ConnectionError, TimeoutError)` | Exactly the two failures that mean "Redis is not answering".                                                 |
+
+**Decision.** Catch the tuple `(redis.exceptions.ConnectionError, redis.exceptions.TimeoutError)`.
+
+**Cost.** Degradation is not instant. With `redis-py` 8.0.0 defaults, `socket_timeout` is 5 seconds, so a `get` against
+an unresponsive Redis can hold the request for up to 5 seconds before it falls back to the database. The same release
+also changed the default retry behavior (its release notes describe 10 attempts with exponential jitter backoff).
+Whether that stacks extra waiting on top of a read timeout depends on `retry_on_timeout`, which the client docs list as
+`False` by default, and on how our client is created. Treat 5 seconds as the per-attempt figure and measure the real
+worst case before quoting a total.
+
+### 2. Read and write use the same exceptions
+
+**Decision.** The read path catches the same set as the write path.
+
+**Behavior.** If `set` times out after a successful database read, the client still gets `200` with results. The log
+carries `WRITE_FAILED` at `WARNING`.
+
+**Why.** One rule for both directions is easier to reason about and to test.
+
+### 3. `cache_status` and log levels
+
+**Context.** One structured field on every `search()` log record shows what the cache did.
+
+**Decision.**
+
+| `cache_status` | Level     | Meaning                        |
+|----------------|-----------|--------------------------------|
+| `HIT`          | `INFO`    | A cached result was retrieved. |
+| `MISS`         | `INFO`    | No cached result was found.    |
+| `READ_FAILED`  | `ERROR`   | Reading from Redis failed.     |
+| `WRITE_FAILED` | `WARNING` | Writing to Redis failed.       |
+
+A timeout on read is `READ_FAILED` at `ERROR`, the same as a connection error.
+
+**Why separate read and write failures.** The logs show exactly which stage of caching broke, which makes debugging and
+monitoring easier.
+
+**Cost.** By status alone, a timeout and a dropped connection look the same. The exception class can be added to `extra`
+to tell them apart. That is optional and not planned for now.
 
 ---
 
-## Test Isolation
+## Concurrency
 
-Patch the Redis factory function and clear the cache before each test.
+### Blocking calls inside `async def search()`
 
-Using the factory function instead of patching an already-created client prevents tests from sharing the same Redis
-client state and potentially affecting one another.
+**Context.** Two synchronous operations ran directly on the event-loop thread, with no `await` and no threadpool
+wrapper.
 
-The goal is to keep each test isolated and deterministic.
+| Operation                                    | Why it blocks                                                                                                                                                          |
+|----------------------------------------------|------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| `redis_client.get(...)` / `.set(...)`        | The client comes from `redis.from_url(...)`, the standard synchronous `redis-py` client, not `redis.asyncio`. Each call waits on network I/O while holding the thread. |
+| `db.query(Chunk, Document.title, ...).all()` | The session comes from `SessionLocal()` in `app/database/db.py`: a synchronous `Session`, not an `AsyncSession`. It waits on PostgreSQL while holding the thread.      |
+
+The embedding call, `get_embedding(q)`, was already correct. `embedding_service.py` runs the CPU-bound
+`generate_embeddings_sync` through `await run_in_threadpool(...)`.
+
+**The real problem.** Slowness alone is not the issue. These calls run on the event-loop thread and never hand control
+back, so no other coroutine can run until they finish. `run_in_threadpool` moves the wait onto a separate thread, and
+the loop keeps working.
+
+**Decision.** Synchronous I/O and CPU-bound work must not run directly inside an `async def` request handler. Wrap Redis
+calls and the database query in `run_in_threadpool`.
 
 ---
 
-## Redis Unavailability Test
+## Testing
 
-An error occurred in the Redis-unavailability test:
+### Test isolation
 
-```text
+**Decision.** Patch the Redis factory function and clear the cache before each test.
+
+**Why.** Patching the factory, rather than an already-created client, stops tests from sharing client state. Each test
+stays isolated and deterministic.
+
+### Reading log records safely
+
+**Context.** The Redis-unavailability test failed with an `AttributeError`:
+
+```python
 any(record.cache_status == ...)
 ```
 
-raised an `AttributeError` for log records that did not contain the `cache_status` attribute.
+Records from other loggers, such as `profiler` and `httpx2`, have no `cache_status` attribute. `any()` stops at the
+first truthy result, but it does not ignore exceptions raised while evaluating each item, so the first record without
+the attribute raised.
 
-Some records, such as `profiler` and `httpx2` logs, do not define this field.
-
-### Why This Happened
-
-`any()` evaluates its condition for each item in the iterable until it finds a truthy result. It does not automatically
-ignore exceptions raised while evaluating the condition.
-
-Therefore, accessing:
-
-```python
-record.cache_status
-```
-
-raises `AttributeError` when the current record does not contain that attribute.
-
-### Solution
-
-Use:
+**Decision.** Read the attribute with a default:
 
 ```python
 getattr(record, "cache_status", None)
 ```
 
-This safely returns `None` when the attribute does not exist. The comparison then evaluates to `False` instead of
-raising an exception.
+A missing attribute becomes `None`, the comparison is `False`, and nothing is raised.
+
+### Testing concurrency with module-level imports
+
+**Context.** The application isolates slow synchronous I/O with Starlette's `run_in_threadpool`. To prove that the event
+loop stays free, the tests inject latency. The database session is injected per request through `Depends`, so FastAPI's
+`app.dependency_overrides` works. The Redis client is created at module level in `app/api/search.py` through
+`redis.from_url(...)` and imported directly, so `dependency_overrides` cannot reach it.
+
+**Decision.** A hybrid strategy:
+
+1. **Database.** Use `app.dependency_overrides` to inject a `FakeSlowDatabase`.
+2. **Redis.** Use `unittest.mock.patch` (or `monkeypatch`) on the import path `app.api.search.redis_client`.
+
+Both fakes call a synchronous `time.sleep()`, which imitates a blocking network driver. If `run_in_threadpool` works,
+the event loop stays responsive.
+
+**How it runs.**
+
+- The factory `get_redis_client` is mocked at the function level rather than on an instance, because it is evaluated at
+  runtime in the route body.
+- `get_embedding` is stubbed, so tests never touch third-party vector dependencies.
+- Each fake sleeps 1.0 s, and the pass threshold for the whole test is 4.0 s. As a negative control, the threaded
+  version finishes in about 3.1 s, while a blocked version scales to 5.03 s.
+
+**Benefits.**
+
+- Covers both database and Redis thread scheduling inside the real HTTP pipeline.
+- Needs no production code changes, such as forcing `Depends(get_redis)` just for tests.
+- `time.sleep()` in an isolated thread imitates real network lag without stalling the test runner.
+
+**Cost.**
+
+- **Brittle import path.** `mock.patch` needs the exact string `app.api.search.redis_client`. If files or imports move,
+  the patch can silently stop intercepting the client.
+- **Global state.** Patching module-level attributes can leak into other tests unless the patch is scoped and torn down
+  inside a pytest fixture.
 
 ---
 
-# Blocking Operations Inside `async def search()`
+## CI
 
-Two synchronous blocking operations were identified inside `async def search()`.
+### How CI receives `.env`
 
-Both execute without `await` and without a threadpool wrapper.
+**Context.** `ci.yml` never created a `.env` file, but the `test-runner` service requires one through `env_file`.
+Without it, Docker Compose fails before any container starts. `.env` is ignored by Git, and the CI runner does a clean
+checkout, so the file is not there. The test runner takes only `APP_TITLE` from it; every other value is overridden by
+`environment` in `docker-compose.test.yml`.
 
-## 1. Synchronous Redis Operations
+**Options.**
 
-```python
-redis_client.get(cache_key)
-redis_client.set(...)
-```
+| Option                                            | Verdict                                                                                                                                                           |
+|---------------------------------------------------|-------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| Commit `.env` to the repository                   | Conflicts with `.gitignore` and with basic security practice for environment files.                                                                               |
+| Create `.env` in the workflow from `.env.example` | Keeps CI derived from the one committed template.                                                                                                                 |
+| Remove the dependency on `.env`                   | Either drop `env_file` and duplicate configuration in two places, or use `required: false`, which needs Compose 2.24.0 or newer and fails hard on older versions. |
 
-The Redis client is created using:
+**Decision.** CI runs `cp .env.example .env` before Compose starts.
 
-```python
-redis.from_url(...)
-```
+**Why.** CI stays derived from a single template. A hand-built list of variables would need an update every time a field
+in `Settings` changes, which is drift waiting to happen.
 
-This uses the standard synchronous `redis-py` client rather than `redis.asyncio`. Therefore, `.get()` and `.set()` are
-synchronous methods and cannot be awaited.
+**Cost.**
 
-These operations perform blocking network I/O to Redis. While waiting for a Redis response, the event-loop thread
-remains occupied and cannot execute other coroutines.
-
----
-
-## 2. Synchronous SQLAlchemy Query
-
-```python
-db.query(
-    Chunk,
-    Document.title,
-    ...
-).all()
-```
-
-The database session is created through `SessionLocal()` in:
-
-```text
-app/database/db.py
-```
-
-This is a standard synchronous SQLAlchemy `Session`, not an `AsyncSession`.
-
-Therefore:
-
-```python
-.query(...).all()
-```
-
-performs synchronous database I/O without `await` and without a threadpool wrapper.
-
-While waiting for PostgreSQL to respond, the event-loop thread remains blocked and cannot process other coroutines.
-
----
-
-## Non-Blocking Comparison: Embedding Generation
-
-The following operation inside `search()` is already handled correctly:
-
-```python
-get_embedding(q)
-```
-
-`embedding_service.py` wraps the CPU-bound model execution (`generate_embeddings_sync`) with:
-
-```python
-await run_in_threadpool(...)
-```
-
-This moves the blocking CPU-bound operation to a separate thread and allows the event loop to continue processing other
-asynchronous tasks while the operation is running.
-
----
-
-# Why These Operations Are Blocking
-
-The issue is not simply that these operations may be slow.
-
-The critical issue is that they are **synchronous operations executed directly on the event-loop thread**. Because they
-do not yield control back to the event loop, other coroutines cannot execute while these operations are in progress.
-
-In other words:
-
-* `redis_client.get()` blocks the event loop while waiting for Redis.
-* `redis_client.set()` blocks the event loop while writing to Redis.
-* `db.query(...).all()` blocks the event loop while waiting for PostgreSQL.
-* `await run_in_threadpool(...)` does not block the event loop because the blocking work is executed in a separate
-  thread.
-
-The architectural requirement is therefore:
-
-> Synchronous I/O or CPU-bound operations must not be executed directly inside an `async def` request handler when they
-> can block the event-loop thread.
-
-# Architectural Decision Record: Testing Concurrency and Latency with Module-Level Imports
-
-## Context
-
-Our FastAPI RAG application isolates slow synchronous I/O operations (Database queries and Redis caching) using
-Starlette's `run_in_threadpool`. To ensure that these operations run asynchronously in background threads and do not
-freeze the main Event Loop, we need automated concurrency testing with injected latency.
-
-However, while the database session (`db`) is injected per-request using FastAPI's `Depends`, the `redis_client` is
-initialized globally at the module level (`app/api/search.py`) via `redis.from_url(...)` and imported directly. This
-prevents us from using FastAPI's native `app.dependency_overrides` for Redis.
-
-## Decision
-
-We will use a **Hybrid Isolation Strategy**:
-
-1. **Database:** Standard `app.dependency_overrides` to inject a simulated `FakeSlowDatabase`.
-2. **Redis:** Module-level mocking using `unittest.mock.patch` (or pytest's `monkeypatch`) targeting the specific import
-   path `app.api.search.redis_client`.
-
-Both fakes will implement synchronous `time.sleep()` to rigorously simulate the blocking behavior of real networking
-drivers, verifying that `run_in_threadpool` prevents Event Loop degradation.
-
-Additionally, our execution mechanics dictate that:
-
-* The factory method `get_redis_client` is mocked at the function level rather than an object instance to accommodate
-  runtime evaluation in the route body.
-* The `get_embedding` helper method is also systematically intercepted and stubbed to avoid hitting third-party vector
-  dependencies during execution.
-* A base delay of 1.0s alongside an overall test threshold of 4.0s are established via negative control metrics
-  (verifying async threadpool concurrency at 3.1s versus sequential block failure scaling to 5.03s).
-
-## Trade-offs of the Hybrid Approach
-
-### Pros
-
-* **Complete Test Coverage:** Safely validates both the DB thread scheduling and Redis thread scheduling inside the
-  actual HTTP endpoint pipeline.
-* **Zero Production Code Changes:** We do not need to rewrite stable production code or force `Depends(get_redis)` onto
-  the codebase solely to satisfy a test framework.
-* **High Controllability:** Synchronous `time.sleep()` within the isolated thread mimics real network lag perfectly
-  without breaking the test runner's execution queue.
-
-### Cons
-
-* **Brittle Import Paths:** Using `mock.patch` requires hardcoding the exact string path where `redis_client` is
-  consumed (`app.api.search.redis_client`). If the file structure or internal imports change, the test will silently
-  fail to intercept the client.
-* **Global State Risks:** Modifying module-level attributes can pollute other tests if the patch is not carefully torn
-  down or scoped properly within pytest fixtures.
-
-# Architectural Decision Record: How CI Receives `.env`
-
-## Context
-
-`ci.yml` did not create a `.env` file, while the `test-runner` service requires one through `env_file`; without it,
-Docker Compose fails before any container starts. The `.env` file is ignored by Git and the CI runner performs a clean
-checkout, so the file is not present, while the test runner only actually takes `app_title` from it because the
-remaining values are overridden by `environment` in `docker-compose.test.yml`.
-
-## Options considered
-
-1. **Commit `.env` to the repository.** This conflicts with the repository's `.gitignore` policy and standard security
-   practices for environment configuration.
-2. **Create `.env` in the workflow.** The workflow can create the required file from the committed `.env.example` before
-   starting Docker Compose.
-3. **Remove the dependency on `.env`.** This could be done either by removing `env_file` and duplicating the
-   configuration in two places, or by using `required: false`, which requires Compose 2.24.0 or newer and produces a
-   hard failure on older Compose versions.
-
-## Decision
-
-CI will create the required file with `cp .env.example .env`, because copying keeps the CI configuration derived from
-the single committed template instead of manually maintaining a second list of environment-variable assignments. A
-manually constructed list would have to be updated whenever a field in `Settings` changes, creating an avoidable drift
-risk.
-
-## Trade-offs
-
-This keeps secrets out of Git and makes CI depend on `.env.example` remaining valid, while still requiring a workflow
-step before Compose starts. Local development and CI now obtain `.env` through different mechanisms: developers create
-it manually, while CI copies `.env.example`.
-
-The rejected alternatives would either duplicate configuration or impose a Compose-version dependency. Manual
-string-by-string construction would add ongoing maintenance cost because every `Settings` change would require another
-CI configuration update.
-
-* **Dual-Purpose Validation for `.env.example`:** Every CI run now exercises the committed `.env.example`; if a required
-  value used by the test runner is missing or invalid, the CI pipeline can fail. This validation is limited to
-  configuration that is not overridden by `environment` in `docker-compose.test.yml`; currently, that means `APP_TITLE`.
-* **Divergent Configuration Mechanics:** Local development and the CI runner use separate configuration flows.
-  Developers still create and manage their `.env` files manually on their workstations, while CI dynamically creates its
-  `.env` with `cp .env.example .env`.
+- **A workflow step is still required** before Compose starts, and CI now depends on `.env.example` staying valid.
+- **Two ways to get `.env`.** Developers create it by hand; CI copies the template.
+- **Limited validation.** Every CI run now exercises the committed `.env.example`, and a missing or invalid value can
+  fail the pipeline. That covers only configuration not overridden by `environment` in `docker-compose.test.yml` —
+  today, `APP_TITLE`.

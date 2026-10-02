@@ -1,53 +1,70 @@
-# RAG API
+<h1 align="center">RAG API</h1>
 
-[![CI](https://img.shields.io/github/actions/workflow/status/KulakovVladislav/rag-api/ci.yml?branch=main&label=CI)](https://github.com/KulakovVladislav/rag-api/actions)
+<p align="center">
+  Upload documents. Search them by meaning.<br>
+  Runs entirely on your machine — no API keys, no external services.
+</p>
 
-A production-ready Retrieval-Augmented Generation API built with **FastAPI**, **PostgreSQL + pgvector**, and **local
-sentence-transformers** embeddings. Upload documents, search them semantically — no OpenAI key required.
-
-Document ingestion is **asynchronous**: `POST /api/documents` returns immediately while chunking and embedding run
-in the background, so a 50-page document no longer ties up a Gunicorn worker for 10+ seconds.
+<p align="center">
+  <a href="https://github.com/KulakovVladislav/rag-api/actions"><img alt="CI" src="https://img.shields.io/github/actions/workflow/status/KulakovVladislav/rag-api/ci.yml?branch=main&label=CI"></a>
+</p>
 
 ---
 
-## Table of Contents
+RAG API is a Retrieval-Augmented Generation backend built with **FastAPI**, **PostgreSQL + pgvector**, and local
+**sentence-transformers** embeddings.
 
-- [Overview](#overview)
+Ingestion is **asynchronous**. `POST /api/documents` returns immediately while chunking and embedding run in the
+background, so a 50-page document never ties up a Gunicorn worker for 10+ seconds.
+
+## Highlights
+
+- **Instant uploads.** Documents are accepted right away, then chunked and embedded in the background.
+- **Visible progress.** Every document has a status: `processing`, `completed`, or `failed`.
+- **No duplicate work.** Identical content is rejected at ingestion via a SHA-256 content hash.
+- **Flexible metadata.** Attach any JSON object to a document; it is stored as-is and returned on detail and search
+  reads.
+- **Semantic search.** Cosine similarity over chunks, restricted to `completed` documents.
+- **Fast repeat queries.** Results are cached in Redis and invalidated the moment new content finishes processing.
+- **Traceable.** Every request gets a request ID and a timer, carried through to the logs.
+- **Production-minded probes.** `/system/live` and `/system/ready` back the Docker healthcheck and gate when Nginx
+  starts routing traffic.
+- **Fully local.** Embeddings come from `all-MiniLM-L6-v2` via `sentence-transformers`.
+
+## Contents
+
+- [Getting Started](#getting-started)
 - [Tech Stack](#tech-stack)
 - [Architecture](#architecture)
-- [Async Document Processing](#async-document-processing)
-- [Content Deduplication](#content-deduplication)
-- [Document Metadata](#document-metadata)
-- [Search Result Caching](#search-result-caching)
-- [Observability](#observability)
-- [Seeding Test Data](#seeding-test-data)
-- [Health Checks](#health-checks)
-- [Project Structure](#project-structure)
-- [Getting Started](#getting-started)
+- [Features](#features)
+    - [Async Document Processing](#async-document-processing)
+    - [Content Deduplication](#content-deduplication)
+    - [Document Metadata](#document-metadata)
+    - [Search Result Caching](#search-result-caching)
+    - [Observability](#observability)
+    - [Health Checks](#health-checks)
+    - [Seeding Test Data](#seeding-test-data)
 - [API Reference](#api-reference)
-    - [Search hardening](#search-hardening)
+- [Project Structure](#project-structure)
 - [Running Tests](#running-tests)
 - [Environment Variables](#environment-variables)
 - [Engineering Decisions](#engineering-decisions)
 
 ---
 
-## Overview
+## Getting Started
 
-RAG API implements the core pipeline of a document question-answering system:
+```bash
+cp .env.example .env
+# Edit .env with your values
 
-- Documents are accepted instantly, then chunked and embedded **in the background**
-- Document status (`processing` / `completed` / `failed`) tracks ingestion progress
-- Duplicate content is rejected at ingestion time via a SHA-256 content hash — no wasted embedding work
-- Documents can carry arbitrary, caller-supplied JSON `metadata`, stored as-is and returned on detail/search reads
-- Semantic search finds the most relevant chunks via cosine similarity, and only ever searches `completed` documents
-- Search results are cached in Redis and automatically invalidated as soon as new content finishes processing
-- Every request is tagged with a request ID and timed, for request-level tracing in the logs
-- Liveness and readiness probes (`/system/live`, `/system/ready`) back the Docker healthcheck and gate when
-  Nginx starts routing traffic to the app
-- Everything runs locally — embeddings are generated with `sentence-transformers` (`all-MiniLM-L6-v2`)
+docker compose up --build
+```
 
----
+| Service    | URL                          |
+|------------|------------------------------|
+| API        | `http://localhost:8080`      |
+| Swagger UI | `http://localhost:8080/docs` |
 
 ## Tech Stack
 
@@ -67,176 +84,156 @@ RAG API implements the core pipeline of a document question-answering system:
 
 ## Architecture
 
-```
-        Client
-          │
-          ▼ [Port 8080]
-┌─────────────────────────┐
-│   Nginx (Rate Limiting) │
-└────────────┬────────────┘
-             │ [Port 8000 – internal]
-┌────────────▼────────────┐
-│   FastAPI Application   │
-│  (Gunicorn + Uvicorn)   │
-└──────┬──────────┬───────┘
-       │          │
-┌──────▼───┐  ┌──▼─────┐
-│ Postgres  │  │ Redis  │
-│ pgvector  │  │ Cache  │
-└──────────┘  └────────┘
+```text
+                 Client
+                   │  :8080
+                   ▼
+  ┌─────────────────────────────────┐
+  │      Nginx · rate limiting      │
+  └────────────────┬────────────────┘
+                   │  :8000 (internal)
+  ┌────────────────▼────────────────┐
+  │       FastAPI application       │
+  │       Gunicorn + Uvicorn        │
+  └────────┬───────────────┬────────┘
+           │               │
+     ┌─────▼────┐     ┌────▼─────┐
+     │ Postgres │     │  Redis   │
+     │ pgvector │     │  cache   │
+     └──────────┘     └──────────┘
 ```
 
-### RAG Pipeline
+### RAG pipeline
 
-```
+```text
 POST /api/documents
   → insert document, status="processing"
-  → return 202 immediately            — client is never blocked on embedding
-  → [background] chunk_text()         — splits content into overlapping chunks
-  → [background] get_embeddings()     — encodes chunks via sentence-transformers
-  → [background] db.bulk_save_objects(chunks) + commit  — batch-inserts all chunks in one round trip
-  → [background] status="completed" (or "failed" on exception)
+  → return 202 immediately            — the client is never blocked on embedding
+  → [background] chunk_text()         — split content into overlapping chunks
+  → [background] get_embeddings()     — encode chunks with sentence-transformers
+  → [background] bulk insert chunks   — one round trip, one commit
+  → [background] status="completed"   — or "failed" on any exception
 
 GET /api/search?q=...
-  → encode query         — converts query to vector
-  → cosine search        — pgvector <=> operator, joined and filtered on status="completed"
-  → return top-k chunks  — ranked by similarity score
+  → encode query                      — convert the query to a vector
+  → cosine search                     — pgvector <=>, filtered on status="completed"
+  → return top-k chunks               — ranked by similarity score
 ```
 
 ---
 
-## Async Document Processing
+## Features
 
-`POST /api/documents` no longer does chunking and embedding inline. It creates the document row with
-`status="processing"`, schedules the work via FastAPI `BackgroundTasks`, and returns `202 Accepted` right away.
+### Async Document Processing
 
-```
+`POST /api/documents` creates the document row with `status="processing"`, schedules the work through FastAPI
+`BackgroundTasks`, and returns `202 Accepted` right away.
+
+```text
 POST /api/documents  →  202 {"id": 7, "title": "...", "status": "processing", "chunk_count": 0}
 
-  ... background task runs (chunk → embed → save chunks) ...
+  … background task runs: chunk → embed → save chunks …
 
-GET /api/documents/7  →  200 {"id": 7, ..., "status": "completed", "chunk_count": 4}
+GET /api/documents/7  →  200 {"id": 7, …, "status": "completed", "chunk_count": 4}
 ```
 
-**Document lifecycle (finite state machine)**
+**Lifecycle**
 
-```
+```text
 processing ──success──▶ completed
     │
-    └────failure────▶ failed
+    └─────failure─────▶ failed
 ```
 
-A document never silently disappears between states — any exception during background processing is caught,
-logged with `request_id`, and the document is explicitly marked `failed` rather than being left stuck in
-`processing` forever.
+A document never gets stuck. Any exception during background processing is caught, logged with its `request_id`, and the
+document is explicitly marked `failed`.
 
-**Why a background task instead of Celery?** `BackgroundTasks` runs in the same process and event loop as the
-API, after the response has already been sent. It's the minimal version of "don't block the request on slow work."
-It is **not** real parallelism for CPU-bound work (see [Engineering Decisions](#engineering-decisions) below for
-the tradeoff and when this needs to graduate to Celery/RQ + a worker pool).
+**Why `BackgroundTasks` instead of Celery?** It runs in the same process and event loop as the API, after the response
+has been sent: the minimal version of "don't block the request on slow work." It is **not** real parallelism for
+CPU-bound work. See [Engineering Decisions](#engineering-decisions) for the trade-off and when to graduate to Celery/RQ.
 
-**Chunks are batch-inserted.** Once all chunks for a document are embedded, they're written with a single
-`db.bulk_save_objects(chunks_to_insert)` + one `commit()` — one round trip to Postgres instead of one `INSERT` per
-chunk.
-Its wall-clock time isn't separately measured today (see [Observability](#observability)) — only
-`chunking_time_ms` and `embedding_time_ms` are persisted, so an insert-latency regression wouldn't currently
-show up in either field.
+**Batch inserts.** Once all chunks are embedded, they are written with a single `db.bulk_save_objects(chunks_to_insert)`
+and one `commit()` — one round trip to Postgres instead of one `INSERT` per chunk.
 
-**Search only returns finished documents.** `GET /api/search` joins `chunks` to `documents` and filters
-`status == 'completed'` in SQL, so a query can never return a chunk from a document that's still mid-ingestion or
-that failed halfway through.
+**Finished documents only.** `GET /api/search` joins `chunks` to `documents` and filters on `status == 'completed'` in
+SQL. A query can never return a chunk from a document that is still mid-ingestion or that failed.
 
----
+### Content Deduplication
 
-## Content Deduplication
+Before scheduling any background work, `POST /api/documents` computes a SHA-256 hash of the trimmed content and checks
+it against `documents.content_hash`. If identical content already exists — regardless of its `status` — the request is
+rejected instead of re-chunking and re-embedding the same text.
 
-Before scheduling any background work, `POST /api/documents` computes a SHA-256 hash of the trimmed content and
-checks it against `documents.content_hash`. If a document with identical content already exists — regardless of
-its current `status` — the request is rejected instead of re-chunking and re-embedding the same text.
-
-```
+```text
 POST /api/documents  (content already ingested)
   → 409 Conflict
-  {
-    "detail": "Document with identical content already exists",
-    "existing_document_id": 7
-  }
 ```
 
-This makes retried/duplicated client uploads (double-submits, retried background jobs, re-imported files) free
-instead of silently doubling storage and embedding cost. The check is on exact content, not fuzzy/semantic
-similarity — two documents with the same meaning but different wording are treated as distinct.
+```json
+{
+  "detail": "Document with identical content already exists",
+  "existing_document_id": 7
+}
+```
 
-A database-level `UNIQUE` constraint on `content_hash` (`add_unique_constraint_to_content_hash`) backs this up:
-if two identical requests both pass the in-app `get_document_by_hash()` pre-check before either commits — a
-genuine race — the second `INSERT` is rejected by Postgres itself with an `IntegrityError`, which
-`create_document()` catches and turns into the same `409` response, re-resolving `existing_document_id` against
-the row that actually won the race.
+Double-submits, retried jobs, and re-imported files cost nothing instead of silently doubling storage and embedding
+work. The check is on exact content, not semantic similarity: two documents with the same meaning but different wording
+are distinct.
 
----
+**Race-proof.** A database-level `UNIQUE` constraint on `content_hash` (migration
+`add_unique_constraint_to_content_hash`) backs up the application check. If two identical requests both pass the in-app
+`get_document_by_hash()` pre-check before either commits, Postgres rejects the second `INSERT` with an `IntegrityError`.
+`create_document()` catches it and returns the same `409`, re-resolving `existing_document_id` against the row that
+actually won.
 
-## Document Metadata
+### Document Metadata
 
-`POST /api/documents` accepts an optional `metadata` field — any JSON object, stored verbatim in a `documents`
-column of type `JSONB` (`add_metadata_to_documents` migration). The app doesn't validate its shape or read any
-particular key out of it; it's a free-form place for a caller to attach whatever context matters to them (source
-URL, author, ingestion batch, ACL tags, etc.), queryable later directly in Postgres via `JSONB` operators even
-though the app itself doesn't expose querying by metadata today.
+`POST /api/documents` accepts an optional `metadata` field: any JSON object, stored verbatim in a `JSONB` column
+(migration `add_metadata_to_documents`). The app neither validates its shape nor reads any key from it. Use it for
+source URL, author, ingestion batch, ACL tags, or anything else. It can be queried directly in Postgres with `JSONB`
+operators, though the API does not expose metadata filtering today.
 
-**Why the Python attribute is `doc_metadata`, not `metadata`.** On the `Document` SQLAlchemy model, the column is
-declared as `doc_metadata = Column("metadata", JSONB, nullable=True)` — the *database* column name is `metadata`,
-but the *Python* attribute is `doc_metadata`. This is required, not stylistic: `metadata` is already a reserved
-attribute name on every SQLAlchemy declarative model (`Base.metadata` holds the schema's `MetaData` object, used
-internally for migrations/table reflection), so a column literally named `metadata` would collide with it.
-Pydantic schemas (`DocumentCreate`, `DocumentDetail`, `SearchResult`) mirror this with
-`doc_metadata: Optional[dict] = Field(default=None, alias="metadata")` plus
-`model_config = ConfigDict(populate_by_name=True)`, so the wire format (JSON body/response key `"metadata"`)
-stays clean while the Python code underneath uses `doc_metadata` throughout.
+**Why the Python attribute is `doc_metadata`.** On the `Document` model the column is declared as
+`doc_metadata = Column("metadata", JSONB, nullable=True)`. The database column is `metadata`, but `metadata` is reserved
+on every SQLAlchemy declarative model (`Base.metadata` holds the schema's `MetaData` object), so the Python attribute
+must be named differently. The Pydantic schemas (`DocumentCreate`, `DocumentDetail`, `SearchResult`) mirror this with
+`doc_metadata: Optional[dict] = Field(default=None, alias="metadata")` and
+`model_config = ConfigDict(populate_by_name=True)`. The JSON wire format keeps the clean `"metadata"` key.
 
-**Where it does and doesn't appear.** `metadata` is accepted on `POST /api/documents` and returned by
-`GET /api/documents/{id}` and `GET /api/search` — but *not* by the `202` creation response or the
-`GET /api/documents` list, because both of those use the plain `DocumentResponse` schema, which was never
-extended with the field. If you need to confirm what metadata was stored right after creating a document, fetch
-it via `GET /api/documents/{id}` rather than trusting the `202` body.
+**Where it appears.** `metadata` is accepted on `POST /api/documents` and returned by `GET /api/documents/{id}` and
+`GET /api/search`. It is **not** returned by the `202` creation response or the `GET /api/documents` list, because both
+use the plain `DocumentResponse` schema. To confirm what was stored, fetch it with `GET /api/documents/{id}`.
 
-**Covered by tests.** Four tests in `tests/test_api.py` exercise `metadata`: it is stored on create and read back
-via `GET /api/documents/{id}`, a document created without it returns `null`, it comes back on `GET /api/search`
-results, and a non-object value (e.g. a string) is rejected with `422`. The alias wiring (`Field(alias=...)` +
-`populate_by_name`) is therefore guarded against silent breakage.
+**Tested.** Four tests in `tests/test_api.py` cover it: stored on create and read back, `null` when omitted, included in
+search results, and a non-object value rejected with `422`. This guards the alias wiring against silent breakage.
 
----
+### Search Result Caching
 
-## Search Result Caching
+`GET /api/search` is backed by Redis. The cache key is an MD5 hash of the normalized query (lowercased, stripped) plus
+`top_k`, so identical searches share one entry, even across clients.
 
-`GET /api/search` is backed by Redis. The cache key is an MD5 hash of the normalized query (`lowercased`,
-`stripped`) plus `top_k`, so identical searches — even across different clients — hit the same cache entry.
+| Outcome          | Behavior                                                                                                                                     |
+|------------------|----------------------------------------------------------------------------------------------------------------------------------------------|
+| **Cache hit**    | Served straight from Redis with `X-Cache: HIT`. No embedding call, no DB query.                                                              |
+| **Cache miss**   | The query is embedded, pgvector runs, and the result is cached with a TTL (`search_cache_ttl`, default `60s`) with `X-Cache: MISS`.          |
+| **Invalidation** | When a document finishes processing (`status="completed"`), all `search:query:*` keys are flushed, so new content is searchable immediately. |
 
-- **Cache hit** → response served straight from Redis, `X-Cache: HIT` header, no embedding call, no DB query.
-- **Cache miss** → query is embedded, pgvector search runs, result is cached with a TTL (`search_cache_ttl`,
-  default `60s`), `X-Cache: MISS` header.
-- **Invalidation** — every time a document finishes background processing (`status="completed"`), all
-  `search:query:*` keys are flushed, so a newly-ingested document is searchable immediately rather than waiting
-  out the TTL of a stale cached result set.
+This trades a small, bounded amount of staleness for avoiding repeated embedding inference on hot queries.
 
-This trades a small amount of staleness (bounded by the TTL, and actively cleared on new content) for
-avoiding repeated embedding-model inference on hot queries.
+Redis is an optimization, not a dependency: if it is unreachable, searches still succeed as cache misses.
+See [Search hardening](#search-hardening).
 
-Redis is an optimisation, not a dependency of the search path: if it is unreachable, searches still succeed as
-cache misses. See [Search hardening](#search-hardening) for the exact behaviour and the `cache_status` log values.
+### Observability
 
----
+#### Structured JSON logging
 
-## Observability
+Logs are one JSON object per line, emitted by a custom `JsonProfileFormatter` (`app/core/logging.py`). Every line
+carries at least `timestamp`, `level`, `logger_name`, `message`, and `request_id`. Anything passed via
+`logger.info(..., extra={...})` is folded into the same object, so event-specific fields (`method`, `path`,
+`status_code`, `duration_ms` for requests; `document_id`, `chunk_count`, `error` for background processing) appear
+alongside the standard ones.
 
-### Structured JSON logging
-
-Logs are structured JSON, one object per line, emitted via a custom `JsonProfileFormatter`
-(`app/core/logging.py`). Every line has at minimum `timestamp`, `level`, `logger_name`, `message`, and
-`request_id`; anything passed via `logger.info(..., extra={...})` is folded into the same JSON object instead of
-being dropped, so a given event's specific fields (`method`/`path`/`status_code`/`duration_ms` for requests,
-`document_id`/`chunk_count`/`error` for background processing) show up right alongside the standard fields.
-
-Example line for a completed background job:
+A completed background job:
 
 ```json
 {
@@ -251,96 +248,71 @@ Example line for a completed background job:
 }
 ```
 
-### Request tracing
+#### Request tracing
 
-Every request is wrapped by `ProfilerAndExceptionMiddleware`:
+Every request passes through `ProfilerAndExceptionMiddleware`:
 
-- A `request_id` is read from the incoming `X-Request-ID` header, or generated (`uuid4`) if absent, and stored in
-  a `ContextVar` for the duration of the request — so it's available to any logger call downstream without
-  threading it through every function signature.
-- The response carries back `X-Request-ID` and `X-Response-Time` (milliseconds) headers.
-- Every request is logged as a single structured line via the `profiler` logger with `event: "request_completed"`,
-  `method`, `path`, `status_code`, and `duration_ms`, tagged with the `request_id`.
-- Unhandled exceptions are caught inside `ProfilerAndExceptionMiddleware` itself (`app/core/middleware.py`) — a
-  single `try/except Exception` around `call_next()` — which logs the stack trace and returns a `500` with the
-  `request_id`, so a client always gets `{"detail": "Internal Server Error", "request_id": "..."}` instead of a
-  raw traceback, and the `request_id` in the response lets you grep the exact log line for that failure. There is
-  no separate `@app.exception_handler` in `main.py` — the middleware is the only catch-all.
+- The `request_id` is read from the incoming `X-Request-ID` header, or generated (`uuid4`) if absent. It is stored in a
+  `ContextVar` for the life of the request, so any downstream logger call can use it without threading it through
+  function signatures.
+- The response carries `X-Request-ID` and `X-Response-Time` (milliseconds) headers.
+- Each request is logged as one structured line by the `profiler` logger with `event: "request_completed"`, `method`,
+  `path`, `status_code`, and `duration_ms`.
+- Unhandled exceptions are caught by a single `try/except Exception` around `call_next()` in `app/core/middleware.py`.
+  The stack trace is logged and the client receives a `500` with
+  `{"detail": "Internal Server Error", "request_id": "..."}`, never a raw traceback. Use the `request_id` to find the
+  exact log line. There is no separate `@app.exception_handler` in `main.py`; the middleware is the only catch-all.
 
-### Background task logging
+#### Background task logging
 
-`process_document_background()` runs after the response has already gone out — outside the request/response
-cycle the middleware wraps — so the `ContextVar` set by the middleware is already reset by the time it executes
-and `request_id_ctx.get()` would raise `LookupError` there. Instead, `documents.py` reads `request_id_ctx.get()`
-**before** calling `background_tasks.add_task(...)` (while the context is still alive) and passes it as an
-explicit `request_id` parameter, which the background task then logs via `extra={"request_id": ...}` on all
-three of its structured events: `document_processing_started`, `document_processing_completed` (with
-`chunk_count` and `total_processing_time_ms`), and `document_processing_failed` (with `error`). This keeps every
-background log line correlated with the request that triggered it, without relying on the ContextVar surviving
-past the response.
+`process_document_background()` runs after the response has gone out, outside the request/response cycle the middleware
+wraps. By then the middleware's `ContextVar` has been reset, and `request_id_ctx.get()` would raise `LookupError`.
 
-**Not currently logged: per-batch insert timing.** The chunk insert (`db.bulk_save_objects(chunks_to_insert)`)
-isn't separately timed or logged anywhere — only `chunking_time_ms` and `embedding_time_ms` are persisted on the
-`Document` row. If insert latency needs visibility later, it'd need its own timer and log line.
+So `documents.py` reads `request_id_ctx.get()` **before** calling `background_tasks.add_task(...)`, while the context is
+still alive, and passes it in as an explicit `request_id` parameter. The task logs it via `extra={"request_id": ...}` on
+all three of its events: `document_processing_started`, `document_processing_completed` (with `chunk_count` and
+`total_processing_time_ms`), and `document_processing_failed` (with `error`). Every background log line stays correlated
+with the request that triggered it.
 
-### DB session handling — `get_db_context()`
+> **Not logged today: per-batch insert timing.** The chunk insert (`db.bulk_save_objects(chunks_to_insert)`) is not
+> timed. Only `chunking_time_ms` and `embedding_time_ms` are persisted on the `Document` row, so an insert-latency
+> regression would not show up in either field. If insert latency needs visibility, it needs its own timer and log line.
 
-Two call sites needed a DB session outside of FastAPI's `Depends(get_db)` mechanism: `document_service.py`
-(background task) and `system.py` (health checks). Both previously did `closing(next(get_db()))`, which only
-worked by relying on the generator-based `get_db()` — written for `Depends`, with commit/close code *after* the
-`yield` — being driven to completion by `next()`. That's not guaranteed: `next()` only advances the generator to
-its `yield`; nothing forces it to resume and run the commit/close that follows. It happened to work here only
-because of when the generator object got garbage-collected, which is not something to depend on.
+#### DB session handling — `get_db_context()`
 
-`get_db_context()` (`app/database/db.py`), a plain `@contextlib.contextmanager` with the same
-commit/rollback/close body, replaces that pattern: a `with get_db_context() as db:` block is *guaranteed* to run
-the code after `yield` when the block exits (normally or via exception), because `contextlib` drives the
-generator explicitly via `__exit__`, unlike `next()` on a bare generator.
+Two call sites need a DB session outside FastAPI's `Depends(get_db)`: the background task in `document_service.py` and
+the health checks in `system.py`. Both used to call `closing(next(get_db()))`. That only worked because `next()`
+advances the generator to its `yield`, and nothing forces it to resume and run the commit/close code after it. It
+happened to work because of when the generator was garbage-collected, which is not something to depend on.
 
----
+`get_db_context()` (`app/database/db.py`) replaces that pattern. It is a plain `@contextlib.contextmanager` with the
+same commit/rollback/close body. A `with get_db_context() as db:` block is **guaranteed** to run the code after `yield`
+on exit, normally or via exception, because `contextlib` drives the generator through `__exit__`.
 
-## Seeding Test Data
+### Health Checks
 
-`scripts/populate_rag.py` inserts 50 sample documents (rotating across four topics) directly with
-`status="completed"`, using the same `hash_content()` and chunking/embedding services as the API itself — so
-seeded documents are immediately visible to `GET /api/search`, with no separate "wait for background processing"
-step.
+Two endpoints under `/system`, split by purpose so orchestration and reverse-proxy checks target the right one.
 
-```bash
-docker compose exec app python scripts/populate_rag.py
-```
+#### `GET /system/live`
 
-Useful for populating a fresh local database with searchable content without manually POSTing 50 documents.
+Liveness probe. Always returns `200` with `{"status": "alive"}` as long as the process can respond. It does **not**
+touch the database, Redis, or the embedding model. It answers "is the process up?", never "is it working correctly?".
 
----
+#### `GET /system/ready`
 
-## Health Checks
+Readiness probe, validated against the `ReadinessResponse` schema. It checks three hard dependencies on every call:
 
-Two endpoints under `/system`, split by purpose (liveness vs. readiness) so orchestration and reverse-proxy
-health checks target the right one:
+- **`database`** — opens a fresh session via `get_db_context()` and runs `SELECT 1`.
+- **`redis`** — sends a `PING`.
+- **`embedding_model`** — runs a real embedding call (`get_embedding("healthcheck")`), so a model that failed to load or
+  a broken inference path is caught, not just connectivity.
 
-### `GET /system/live`
+Each check returns `"ok"` or `"unreachable"`. An exception in any check is caught and logged; it never turns the health
+endpoint itself into a `500`.
 
-Liveness probe. Always returns `200` with `{"status": "alive"}` as long as the process can respond to a
-request — it does **not** touch the database, Redis, or the embedding model. Answers only "is the process up",
-never "is it working correctly".
-
-### `GET /system/ready`
-
-Readiness probe (response validated against the `ReadinessResponse` schema). Checks the three hard dependencies
-on every call:
-
-- **`database`** — opens a fresh session via `get_db_context()` and runs `SELECT 1`
-- **`redis`** — `PING`s the Redis client
-- **`embedding_model`** — runs a real embedding call (`get_embedding("healthcheck")`) through
-  `sentence-transformers`, so a model that failed to load or a broken inference path is caught too, not just
-  connectivity
-
-Each check independently returns `"ok"` or `"unreachable"` — an exception in any check is caught and logged,
-never allowed to bubble up and 500 the health endpoint itself.
+`200` — all dependencies healthy:
 
 ```json
-// 200 — all dependencies healthy
 {
   "status": "ready",
   "checks": {
@@ -351,8 +323,9 @@ never allowed to bubble up and 500 the health endpoint itself.
 }
 ```
 
+`503` — at least one dependency down:
+
 ```json
-// 503 — at least one dependency down
 {
   "status": "unavailable",
   "checks": {
@@ -363,64 +336,19 @@ never allowed to bubble up and 500 the health endpoint itself.
 }
 ```
 
-`/system/ready` returns `503 Service Unavailable` unless *all* checks pass — a single failing dependency is
-enough to mark the whole service not-ready, which is what `docker-compose.yml`'s `app` healthcheck polls
-(`curl -f http://localhost:8000/system/ready`) to decide when Nginx should start routing traffic to it.
+The endpoint returns `503 Service Unavailable` unless **all** checks pass. This is what the `app` healthcheck in
+`docker-compose.yml` polls (`curl -f http://localhost:8000/system/ready`) to decide when Nginx may start routing
+traffic.
 
----
+### Seeding Test Data
 
-## Project Structure
-
-```
-rag-api/
-├── app/
-│   ├── api/
-│   │   ├── documents.py          # POST/GET/DELETE /api/documents, background task trigger, dedup check
-│   │   ├── search.py             # GET /api/search (Redis cache, filters status="completed")
-│   │   └── system.py             # GET /system/live, /system/ready (DB, Redis, embedding model checks)
-│   ├── core/
-│   │   ├── context.py            # ContextVar carrying the current request_id
-│   │   ├── middleware.py         # Request timing + request-id tagging + catch-all error handling
-│   │   ├── logging.py            # "profiler" logger config, injects request_id into log lines
-│   │   └── redis.py              # Cached Redis client factory
-│   ├── database/
-│   │   ├── models.py             # Document (status, content_hash, timing metrics, doc_metadata/JSONB), Chunk models
-│   │   ├── db.py                 # Session management
-│   │   └── base.py               # Declarative base
-│   ├── services/
-│   │   ├── document_service.py   # CRUD, hash_content/get_document_by_hash, background processing, cache invalidation
-│   │   ├── embedding_service.py  # sentence-transformers wrapper (runs off the event loop via threadpool)
-│   │   ├── chunking_service.py   # Fixed-size overlapping text chunking
-│   │   └── search_service.py     # Cosine distance → similarity score conversion
-│   ├── schemas.py                 # Pydantic request/response models (incl. ReadinessResponse, metadata alias)
-│   ├── config.py                 # Pydantic settings (DB, Redis, cache TTL)
-│   └── main.py                   # FastAPI app, router registration
-├── alembic/                      # Database migrations (status, HNSW index, content_hash + metrics, unique constraint, metadata)
-├── tests/                        # Pytest test suite (44 tests)
-├── docker-compose.yml            # Production stack (app + Postgres/pgvector + Redis + Nginx)
-├── docker-compose.test.yml       # Isolated test stack (Postgres + Redis containers)
-├── Dockerfile                    # Multi-stage, non-root
-└── nginx.conf                    # Rate limiting (per-route), proxy config
-```
-
-> `process_document_background()` lives in `app/services/document_service.py`; `app/api/documents.py` only wires
-> it into the route via `BackgroundTasks`.
-
----
-
-## Getting Started
+`scripts/populate_rag.py` inserts 50 sample documents (rotating across four topics) directly with `status="completed"`.
+It uses the same `hash_content()`, chunking, and embedding services as the API, so seeded documents are immediately
+searchable, with no waiting for background processing.
 
 ```bash
-cp .env.example .env
-# Edit .env with your values
-
-docker compose up --build
+docker compose exec app python scripts/populate_rag.py
 ```
-
-|            |                              |
-|------------|------------------------------|
-| API        | `http://localhost:8080`      |
-| Swagger UI | `http://localhost:8080/docs` |
 
 ---
 
@@ -428,8 +356,8 @@ docker compose up --build
 
 ### `POST /api/documents`
 
-Accepts a document and schedules chunking + embedding in the background. Returns immediately — does **not**
-wait for embedding to finish.
+Accepts a document and schedules chunking and embedding in the background. Returns immediately; it does **not** wait for
+embedding to finish.
 
 **Request**
 
@@ -444,8 +372,8 @@ wait for embedding to finish.
 }
 ```
 
-`metadata` is optional and accepts any JSON object — stored as-is in a `JSONB` column, not validated or
-interpreted by the app. Omit it (or send `null`) and it's simply not stored.
+`metadata` is optional and accepts any JSON object. It is stored as-is in a `JSONB` column and never validated or
+interpreted. Omit it (or send `null`) and nothing is stored.
 
 **Response `202 Accepted`**
 
@@ -458,12 +386,11 @@ interpreted by the app. Omit it (or send `null`) and it's simply not stored.
 }
 ```
 
-> Note: the `202` response does **not** echo back `metadata` — `DocumentResponse` (the schema behind both this
-> response and the `GET /api/documents` list) doesn't include the field at all. To confirm what was stored, use
-> `GET /api/documents/{id}` (below), whose `DocumentDetail` schema does include it.
+> **Note:** the `202` response does not echo `metadata`. `DocumentResponse`, the schema behind this response and the
+> `GET /api/documents` list, does not include the field. Use `GET /api/documents/{id}` to confirm what was stored.
 
-**Response `409 Conflict`** — content already ingested (matched by SHA-256 hash, see
-[Content Deduplication](#content-deduplication))
+**Response `409 Conflict`** — content already ingested (matched by SHA-256 hash;
+see [Content Deduplication](#content-deduplication))
 
 ```json
 {
@@ -472,7 +399,7 @@ interpreted by the app. Omit it (or send `null`) and it's simply not stored.
 }
 ```
 
-**Response `422 Unprocessable Entity`** — empty or whitespace-only `content`
+**Response `422 Unprocessable Entity`** — empty or whitespace-only `content`.
 
 ---
 
@@ -499,10 +426,9 @@ Returns the current state of a document, including ingestion status.
 }
 ```
 
-`status` is one of `processing`, `completed`, `failed`. While `processing`, `chunk_count` is `0` and the
-`*_time_ms` fields are `null` — they're populated once background processing finishes, giving per-document
-visibility into how much of the pipeline's latency was chunking vs. embedding. `metadata` is whatever JSON object
-was supplied at creation, or `null` if none was.
+`status` is one of `processing`, `completed`, or `failed`. While `processing`, `chunk_count` is `0` and the `*_time_ms`
+fields are `null`. They are populated when background processing finishes, showing how much of the pipeline's latency
+went to chunking versus embedding. `metadata` is the JSON object supplied at creation, or `null`.
 
 ---
 
@@ -519,16 +445,16 @@ Lists documents with pagination. Each item includes `status` and `chunk_count`.
 
 ### `GET /api/search`
 
-Semantic search over stored chunks. Only searches chunks belonging to `completed` documents. Results are cached
-in Redis (see [Search Result Caching](#search-result-caching)); the response carries an `X-Cache: HIT|MISS`
-header.
+Semantic search over stored chunks. Only chunks belonging to `completed` documents are searched. Results are cached in
+Redis (see [Search Result Caching](#search-result-caching)), and the response carries an `X-Cache: HIT` or
+`X-Cache: MISS` header.
 
 **Query parameters**
 
-| Parameter | Type    | Default  | Description                 |
-|-----------|---------|----------|-----------------------------|
-| `q`       | string  | required | Search query, min. 2 chars  |
-| `top_k`   | integer | `5`      | Number of results to return |
+| Parameter | Type    | Default  | Description                        |
+|-----------|---------|----------|------------------------------------|
+| `q`       | string  | required | Search query, minimum 2 characters |
+| `top_k`   | integer | `5`      | Number of results to return        |
 
 **Response `200`**
 
@@ -547,20 +473,21 @@ header.
 ]
 ```
 
-> `metadata` here is the *parent document's* metadata, carried through the `Chunk`↔`Document` join — every chunk
-> from the same document repeats the same `metadata`, it isn't per-chunk.
+> `metadata` is the *parent document's* metadata, carried through the `Chunk`↔`Document` join. Every chunk from the same
+> document repeats it; it is not per-chunk.
 
-> `score` is `1 - cosine_distance` (see `calculate_cosine_score` in `app/services/search_service.py`) — **higher
-> score = higher similarity**. Results are ordered by ascending cosine distance from pgvector, which is the same
-> as descending `score`, so the first result in the response is always the best match.
+> `score` is `1 - cosine_distance` (see `calculate_cosine_score` in `app/services/search_service.py`), so **a higher
+score means higher similarity**. Results are ordered by ascending cosine distance from pgvector, which is the same as
+> descending `score`. The first result is always the best match.
 
 #### Search hardening
 
 Four guarantees on `GET /api/search`, each backed by code and a test.
 
-**1. Input validation — `q` needs at least 2 characters.** `q` is declared as `Query(min_length=2)`. A shorter
-value never reaches the handler (no embedding, no Redis, no DB): the client gets `422` with FastAPI's standard
-validation body. Real response for `GET /api/search?q=h`:
+**1. Input validation: `q` needs at least 2 characters.**
+
+`q` is declared as `Query(min_length=2)`. A shorter value never reaches the handler (no embedding, no Redis, no DB). The
+client gets a `422` with FastAPI's standard validation body. Real response for `GET /api/search?q=h`:
 
 ```http
 HTTP/1.1 422 Unprocessable Entity
@@ -569,41 +496,46 @@ content-type: application/json
 {"detail":[{"type":"string_too_short","loc":["query","q"],"msg":"String should have at least 2 characters","input":"h","ctx":{"min_length":2}}]}
 ```
 
-An empty `q=` gives the same `string_too_short` error (`"input":""`); an omitted `q` gives
-`{"type":"missing","loc":["query","q"],"msg":"Field required"}`. Both are also `422`. Note the shape: this is
-FastAPI's `detail` list, not the catch-all exception handler's format, and there is no `X-Cache` header on it.
-Two-character queries such as `"ab"` are valid, so short abbreviations still work. Known limit: the length is
-checked on the raw string, so a query of two spaces (`q="  "`) passes validation. Test: `test_if_min_length_works`.
+An empty `q=` gives the same `string_too_short` error (`"input":""`). An omitted `q` gives
+`{"type":"missing","loc":["query","q"],"msg":"Field required"}`. Both are also `422`. This is FastAPI's `detail` list,
+not the catch-all exception middleware's format, and it has no `X-Cache` header. Two-character queries such as `"ab"`
+are valid, so short abbreviations still work.
 
-**2. Redis is optional — a cache outage never fails a search.** Redis is touched twice per uncached request, and
-each touch is wrapped separately:
+> **Known limit:** length is checked on the raw string, so a query of two spaces (`q="  "`) passes validation.
 
-- *Read fails* (`redis.exceptions.ConnectionError` on `get`) → the error is logged at `ERROR` as `READ_FAILED`, the
-  response gets `X-Cache: MISS`, and the request carries on exactly like a normal miss: embed the query, run the
-  pgvector query, return `200` with fresh results.
-- *Write fails* (`ConnectionError` or `TimeoutError` on `set`) → logged at `WARNING` as `WRITE_FAILED`, swallowed,
-  and the already-computed results are returned unchanged.
+Test: `test_if_min_length_works`.
 
-With Redis fully down both happen in the same request: one `READ_FAILED` (`ERROR`) followed by one
-`WRITE_FAILED` (`WARNING`), same `request_id`, status `200`, `X-Cache: MISS`. Verified by running the real
-`search()` against a Redis client pointed at a closed port. Known gap: the read path catches only
-`ConnectionError`; a `TimeoutError` while reading is a separate exception class in `redis-py` and is not caught
-there, so it propagates to the catch-all exception middleware instead of degrading to a miss. Test:
-`test_search_handles_redis_unavailable`.
+**2. Redis is optional: a cache outage never fails a search.**
 
-**3. `cache_status` — one structured log record per cache outcome.** Emitted by `app/api/search.py` through the
-`redis_status` logger (message `cache_status`, extra fields `cache_status` and `cache_key`; `request_id` is added
-by the log filter). It is visible in the JSON stdout logs, e.g. filter on `"logger_name": "redis_status"`:
+Redis is touched twice per uncached request, and each touch is wrapped separately:
 
-| Value          | Level     | Meaning                                       | `X-Cache` header |
-|----------------|-----------|-----------------------------------------------|------------------|
-| `HIT`          | `INFO`    | Result served from Redis                      | `HIT`            |
-| `MISS`         | `INFO`    | Key not in Redis, computed from the database  | `MISS`           |
-| `READ_FAILED`  | `ERROR`   | Redis unreachable on `get`; treated as a miss | `MISS`           |
-| `WRITE_FAILED` | `WARNING` | Redis failed on `set`; result not cached      | `MISS`           |
+- **Read fails** (`ConnectionError` or `TimeoutError` on `get`): logged at `ERROR` as `READ_FAILED`, the response gets
+  `X-Cache: MISS`, and the request carries on like a normal miss: embed the query, run pgvector, return `200` with fresh
+  results.
+- **Write fails** (`ConnectionError` or `TimeoutError` on `set`): logged at `WARNING` as `WRITE_FAILED`, swallowed, and
+  the computed results are returned unchanged.
 
-The header only distinguishes `HIT` from `MISS`; the two failure states exist only in the logs. Real records from
-a run with Redis down:
+With Redis fully down, both happen in the same request: one `READ_FAILED` (`ERROR`), then one `WRITE_FAILED`
+(`WARNING`), with the same `request_id`, status `200`, and `X-Cache: MISS`. Verified by running the real `search()`
+against a Redis client pointed at a closed port.
+
+Test: `test_search_handles_redis_unavailable`.
+
+**3. `cache_status`: one structured log record per cache outcome.**
+
+Emitted by `app/api/search.py` through the `redis_status` logger (message `cache_status`, extra fields `cache_status`
+and `cache_key`; `request_id` is added by the log filter). Filter on `"logger_name": "redis_status"` in the JSON stdout
+logs.
+
+| Value          | Level     | Meaning                                                    | `X-Cache` header |
+|----------------|-----------|------------------------------------------------------------|------------------|
+| `HIT`          | `INFO`    | Result served from Redis                                   | `HIT`            |
+| `MISS`         | `INFO`    | Key not in Redis, computed from the database               | `MISS`           |
+| `READ_FAILED`  | `ERROR`   | Redis unreachable or timed out on `get`; treated as a miss | `MISS`           |
+| `WRITE_FAILED` | `WARNING` | Redis failed or timed out on `set`; result not cached      | `MISS`           |
+
+The header distinguishes only `HIT` from `MISS`; the two failure states exist only in the logs. Real records from a run
+with Redis down (`timestamp` omitted for brevity):
 
 ```json
 {
@@ -614,6 +546,9 @@ a run with Redis down:
   "cache_status": "READ_FAILED",
   "cache_key": "search:query:2abf71b1f72c25e360a97be01dc70fc5"
 }
+```
+
+```json
 {
   "level": "WARNING",
   "logger_name": "redis_status",
@@ -624,20 +559,24 @@ a run with Redis down:
 }
 ```
 
-(`timestamp` field omitted for brevity.) `READ_FAILED` and `WRITE_FAILED` are separate so a log query tells you *which
-stage* of caching broke. Tests: `test_search_handles_redis_hit`, `test_search_handles_redis_miss`,
-`test_search_handles_redis_unavailable`.
+`READ_FAILED` and `WRITE_FAILED` are separate so a log query tells you *which stage* of caching broke.
 
-**4. Async-safe — the handler no longer blocks the event loop.** `search()` is `async def`, but `redis_client.get`,
-`redis_client.set` and the SQLAlchemy `db.query(...).all()` are synchronous (`redis-py` and a sync `Session`), so
-run directly they held the event-loop thread while waiting on Redis/PostgreSQL and stalled every other request on
-that worker. All three are now wrapped in `run_in_threadpool` (embedding was already, via `embedding_service.py`).
-Proof: `test_search_endpoint_does_not_block_event_loop` fires 3 concurrent requests against fakes that
-`time.sleep(1)` in `get`, in `set` and in the DB query (3 s per request) and asserts the whole batch finishes in
-under 4 s. Timings: about 3 s is what the threaded version should take, and about 9 s (3 requests × 3 s) is what
-it would take if every call blocked the loop — both are *calculated* from the fakes' `sleep` values, not
-measured. The *measured* negative control: with only `redis_client.set()` left unwrapped, the same test took
-5.03 s, above the 4 s threshold.
+Tests: `test_search_handles_redis_hit`, `test_search_handles_redis_miss`, `test_search_handles_redis_unavailable`.
+
+**4. Async-safe: the handler does not block the event loop.**
+
+`search()` is `async def`, but `redis_client.get`, `redis_client.set`, and the SQLAlchemy `db.query(...).all()` are
+synchronous (`redis-py` and a sync `Session`). Called directly, they hold the event-loop thread while waiting on Redis
+or PostgreSQL and stall every other request on that worker. All three are wrapped in `run_in_threadpool` (embedding
+already was, via `embedding_service.py`).
+
+Proof: `test_search_endpoint_does_not_block_event_loop` fires 3 concurrent requests against fakes that `time.sleep(1)`
+in `get`, in `set`, and in the DB query (3 s per request), and asserts the whole batch finishes in under 4 s.
+
+- About **3 s** is what the threaded version should take, and about **9 s** (3 requests × 3 s) is what it would take if
+  every call blocked the loop. Both are *calculated* from the fakes' `sleep` values, not measured.
+- The *measured* negative control: with only `redis_client.set()` left unwrapped, the same test took **5.03 s**, above
+  the 4 s threshold.
 
 ---
 
@@ -647,133 +586,180 @@ Deletes a document and its chunks (cascade). Returns `204` on success, `404` if 
 
 ---
 
-### `GET /system/live` / `GET /system/ready`
+### `GET /system/live` and `GET /system/ready`
 
-Liveness and readiness probes — see [Health Checks](#health-checks) for the full breakdown.
+Liveness and readiness probes. See [Health Checks](#health-checks) for the full breakdown.
+
+---
+
+## Project Structure
+
+```text
+rag-api/
+├── app/
+│   ├── api/
+│   │   ├── documents.py          # POST/GET/DELETE /api/documents, background task trigger, dedup check
+│   │   ├── search.py             # GET /api/search (Redis cache, filters status="completed")
+│   │   └── system.py             # GET /system/live, /system/ready (DB, Redis, embedding model checks)
+│   ├── core/
+│   │   ├── context.py            # ContextVar carrying the current request_id
+│   │   ├── middleware.py         # Request timing, request-id tagging, catch-all error handling
+│   │   ├── logging.py            # "profiler" logger config, injects request_id into log lines
+│   │   └── redis.py              # Cached Redis client factory
+│   ├── database/
+│   │   ├── models.py             # Document (status, content_hash, timing metrics, doc_metadata/JSONB), Chunk
+│   │   ├── db.py                 # Session management
+│   │   └── base.py               # Declarative base
+│   ├── services/
+│   │   ├── document_service.py   # CRUD, hash_content/get_document_by_hash, background processing, cache invalidation
+│   │   ├── embedding_service.py  # sentence-transformers wrapper (runs off the event loop via threadpool)
+│   │   ├── chunking_service.py   # Fixed-size overlapping text chunking
+│   │   └── search_service.py     # Cosine distance → similarity score conversion
+│   ├── schemas.py                # Pydantic request/response models (incl. ReadinessResponse, metadata alias)
+│   ├── config.py                 # Pydantic settings (DB, Redis, cache TTL)
+│   └── main.py                   # FastAPI app, router registration
+├── alembic/                      # Migrations (status, HNSW index, content_hash + metrics, unique constraint, metadata)
+├── tests/                        # Pytest suite (45 tests)
+├── docker-compose.yml            # Production stack (app + Postgres/pgvector + Redis + Nginx)
+├── docker-compose.test.yml       # Isolated test stack (Postgres + Redis containers)
+├── Dockerfile                    # Multi-stage, non-root
+└── nginx.conf                    # Per-route rate limiting, proxy config
+```
+
+> `process_document_background()` lives in `app/services/document_service.py`. `app/api/documents.py` only wires it into
+> the route via `BackgroundTasks`.
 
 ---
 
 ## Running Tests
 
-Tests run against isolated PostgreSQL and Redis containers with `tmpfs` for Postgres — no persistent data, no
-side effects.
+Tests run against isolated PostgreSQL and Redis containers, with `tmpfs` for Postgres: no persistent data, no side
+effects.
 
 ```bash
 docker compose -f docker-compose.test.yml up --build --abort-on-container-exit
 ```
 
-44 tests cover:
+**45 tests** cover:
 
-- **Async lifecycle** — immediate `202`/`processing` response, `completed` status with correct `chunk_count` and
-  populated `*_time_ms` fields once background processing finishes, a mocked-failure path landing on
-  `status="failed"`, and search excluding chunks from non-`completed` documents.
-- **Deduplication** — duplicate content against a `completed` document returns `409`, duplicate content against a
-  still-`processing` document also returns `409`, genuinely different content is always accepted, the stored
-  `content_hash` matches an independently-computed hash, and a simulated race (both requests pass the Python-level
-  pre-check) is still caught by the database `UNIQUE` constraint and turned into a `409`.
-- **Search caching** — repeated identical queries return a cache hit, a new query is a cache miss, different
-  `top_k` values produce different cache keys, and the cache is invalidated once a document finishes processing.
-- **Search hardening** — a 1-character `q` returns `422`; with Redis unavailable on read the search still returns
-  `200` with `X-Cache: MISS` and a `READ_FAILED` record; `HIT` and `MISS` records are emitted on the matching
-  paths; and three concurrent requests against artificially slow (`time.sleep`) Redis and DB fakes finish in
-  under 4 s, proving `search()` does not block the event loop.
-- **Document metadata** — stored on create and returned by `GET /api/documents/{id}`, `null` when omitted,
-  included in `GET /api/search` results, and a non-object value is rejected with `422`.
-- **Health checks** — `/system/live` always returns `200`; `/system/ready` returns `200` when database, Redis,
-  and the embedding model all check out, and `503` if any single one (database or Redis) fails, with the
-  per-check breakdown verified in both the healthy and unhealthy response bodies.
-- **CRUD / validation / error handling** — listing, fetching, deleting documents (incl. `404`s), empty/whitespace
-  content rejection (`422`), score ordering, and the catch-all exception-handling middleware's response shape.
-- **Structured logging** — the JSON formatter emits valid JSON with all required fields, a background job's log
-  lines carry the same `request_id` as the triggering request's response header, and a failed document's log
-  line contains the `error` field.
-- **DB session handling** — `get_db_context()` commits and closes on the happy path, and rolls back and closes
-  when the block raises.
-- **`populate_rag.py`** — running the script against a clean database produces documents with
-  `status="completed"` that are immediately visible in `GET /api/search`.
+- **Async lifecycle** — immediate `202`/`processing` response; `completed` status with the correct `chunk_count` and
+  populated `*_time_ms` fields once processing finishes; a mocked failure landing on `status="failed"`; search excluding
+  chunks from non-`completed` documents.
+- **Deduplication** — duplicate content against a `completed` document returns `409`; so does duplicate content against
+  a still-`processing` document; genuinely different content is always accepted; the stored `content_hash` matches an
+  independently computed hash; a simulated race (both requests pass the Python-level pre-check) is still caught by the
+  database `UNIQUE` constraint and turned into a `409`.
+- **Search caching** — repeated identical queries hit the cache; a new query misses; different `top_k` values produce
+  different cache keys; the cache is invalidated once a document finishes processing.
+- **Search hardening** — a 1-character `q` returns `422`; with Redis unavailable or timing out on read, search still
+  returns `200` with `X-Cache: MISS` and a `READ_FAILED` record; `HIT` and `MISS` records are emitted on the matching
+  paths; three concurrent requests against artificially slow (`time.sleep`) Redis and DB fakes finish in under 4 s,
+  proving `search()` does not block the event loop.
+- **Document metadata** — stored on create and returned by `GET /api/documents/{id}`; `null` when omitted; included in
+  `GET /api/search` results; a non-object value rejected with `422`.
+- **Health checks** — `/system/live` always returns `200`. `/system/ready` returns `200` when the database, Redis, and
+  embedding model all check out, and `503` when any single one fails. The per-check breakdown is verified in both the
+  healthy and unhealthy response bodies.
+- **CRUD / validation / error handling** — listing, fetching, and deleting documents (including `404`s); empty and
+  whitespace-only content rejection (`422`); score ordering; the response shape of the catch-all exception middleware.
+- **Structured logging** — the JSON formatter emits valid JSON with all required fields; a background job's log lines
+  carry the same `request_id` as the triggering request's response header; a failed document's log line contains the
+  `error` field.
+- **DB session handling** — `get_db_context()` commits and closes on the happy path, and rolls back and closes when the
+  block raises.
+- **`populate_rag.py`** — running the script against a clean database produces `completed` documents that are
+  immediately visible in `GET /api/search`.
 
 ---
 
 ## Environment Variables
 
-See `.env.example` for all required variables. The most relevant ones beyond standard Postgres/app settings:
+See `.env.example` for every required variable. The most relevant ones beyond standard Postgres and app settings:
 
-| Variable                             | Used by                              | Default                                | Notes                                                                                       |
-|--------------------------------------|--------------------------------------|----------------------------------------|---------------------------------------------------------------------------------------------|
-| `REDIS_URL`                          | `app/config.py` → `redis_url`        | `redis://redis:6379/0`                 | Backs both search caching and cache invalidation.                                           |
-| `SEARCH_CACHE_TTL`                   | `app/config.py` → `search_cache_ttl` | `60` (seconds)                         | Set directly in `.env.example`; override it in your own `.env` if you need a different TTL. |
-| `DATABASE_URL` / `TEST_DATABASE_URL` | `app/config.py`                      | — (required)                           | Full SQLAlchemy connection strings; `TEST_DATABASE_URL` is used by the isolated test stack. |
-| `APP_TITLE`                          | `app/config.py` → `app_title`        | — (required, no default in `Settings`) | Used as the FastAPI app title (shown in Swagger UI at `/docs`).                             |
+| Variable                             | Used by                              | Default                             | Notes                                                                                       |
+|--------------------------------------|--------------------------------------|-------------------------------------|---------------------------------------------------------------------------------------------|
+| `REDIS_URL`                          | `app/config.py` → `redis_url`        | `redis://redis:6379/0`              | Backs both search caching and cache invalidation.                                           |
+| `SEARCH_CACHE_TTL`                   | `app/config.py` → `search_cache_ttl` | `60` (seconds)                      | Set in `.env.example`; override it in your own `.env` for a different TTL.                  |
+| `DATABASE_URL` / `TEST_DATABASE_URL` | `app/config.py`                      | Required                            | Full SQLAlchemy connection strings. `TEST_DATABASE_URL` is used by the isolated test stack. |
+| `APP_TITLE`                          | `app/config.py` → `app_title`        | Required (no default in `Settings`) | Used as the FastAPI app title, shown in Swagger UI at `/docs`.                              |
 
 ---
 
 ## Engineering Decisions
 
-**pgvector over a dedicated vector DB (Pinecone, Weaviate)**
+### pgvector over a dedicated vector DB (Pinecone, Weaviate)
 
-At this scale, PostgreSQL + pgvector eliminates the operational overhead of running a separate service. The HNSW
-index delivers sub-millisecond search. A dedicated vector DB becomes worthwhile at 10M+ vectors or when
-multi-tenancy grows complex.
+At this scale, PostgreSQL + pgvector removes the operational overhead of running a separate service, and the HNSW index
+keeps search fast. A dedicated vector database becomes worthwhile at around 10M+ vectors or when multi-tenancy grows
+complex.
 
-**Local sentence-transformers over OpenAI embeddings**
+### Local sentence-transformers over OpenAI embeddings
 
 Zero API cost, zero external dependency, fully reproducible results. `all-MiniLM-L6-v2` produces 384-dimensional
-embeddings — smaller and faster than OpenAI's 1536-dimensional `text-embedding-ada-002`, with comparable quality for
-English retrieval.
+embeddings, smaller and faster than the 1536-dimensional vectors of OpenAI's `text-embedding-ada-002`, with strong
+retrieval quality for English.
 
-**HNSW index over IVFFlat**
+### HNSW index over IVFFlat
 
-HNSW builds incrementally and works on an empty table. IVFFlat requires a `VACUUM ANALYZE` after bulk inserts to
-build clusters. HNSW uses more memory but delivers better query-time performance and simpler operational behaviour.
+HNSW builds incrementally and works on an empty table. IVFFlat builds its clusters from existing data, so it needs a
+populated table, and it requires re-indexing and a `VACUUM ANALYZE` after bulk inserts. HNSW uses more memory but
+delivers better query-time performance and simpler operational behavior.
 
-**`BackgroundTasks` over Celery — for now**
+### `BackgroundTasks` over Celery, for now
 
 `BackgroundTasks` runs in-process, in the same event loop, after the response is sent. For CPU-bound work like
-`sentence-transformers` inference, that means the embedding call occupies the worker — other requests hitting that
-same Gunicorn worker queue behind it until embedding finishes (mitigated today by `run_in_threadpool` inside
-`embedding_service.py`, which moves the blocking call off the main event loop thread, but it's still bounded by
-the same process's thread pool, not truly isolated). A real task queue (Celery/RQ + Redis or RabbitMQ) runs work
-in separate processes, so a burst of slow embedding jobs can't starve API request handling at all, and jobs survive
-a process restart. `BackgroundTasks` is the right call for getting unblocked today; Celery is the right call once
-ingestion volume or embedding latency grows enough that a single failed deploy can't be allowed to drop in-flight
-jobs.
+`sentence-transformers` inference, the embedding call occupies the worker, and other requests hitting the same Gunicorn
+worker queue behind it until embedding finishes.
 
-**Batch insert (`bulk_save_objects`) over per-chunk `INSERT`**
+This is mitigated today by `run_in_threadpool` inside `embedding_service.py`, which moves the blocking call off the main
+event-loop thread. But it is still bounded by the same process's thread pool, so it is not truly isolated.
 
-Chunks for a document are inserted in a single `db.bulk_save_objects(chunks_to_insert)` + one `commit()`, rather than
-one
-`INSERT` per chunk. This is one network round trip to Postgres regardless of chunk count, instead of N — the
-difference is negligible for a handful of chunks but compounds directly with document length. Its wall time isn't
-separately measured (see [Observability](#observability)) — worth adding if chunk counts grow enough that insert
-latency needs its own visibility, distinct from `chunking_time_ms`/`embedding_time_ms`.
+A real task queue (Celery/RQ + Redis or RabbitMQ) runs work in separate processes. A burst of slow embedding jobs can't
+starve API request handling, and jobs survive a process restart.
 
-**Why an explicit `status` column instead of inferring state from `chunk_count`**
+- **Today:** `BackgroundTasks` is the right call to get unblocked.
+- **Later:** move to Celery once ingestion volume or embedding latency grows to the point where a single failed deploy
+  must not be allowed to drop in-flight jobs.
 
-`chunk_count == 0` is ambiguous: it's true both for a document that hasn't started processing yet *and* for one
-that failed immediately (e.g., chunking threw before any chunk was created) *and*, by coincidence, for a real edge
-case — an empty/degenerate document that legitimately produces zero chunks after `completed` processing. An
-explicit `status` column removes the guesswork and the race condition where a client polling on `chunk_count > 0`
-would report `completed` prematurely if it caught the document between chunk-row inserts (e.g. after 2 of 4 chunks
-were committed, before the final `status="completed"` update lands).
+### Batch insert (`bulk_save_objects`) over per-chunk `INSERT`
 
-**A fresh DB session for background tasks**
+Chunks are inserted with a single `db.bulk_save_objects(chunks_to_insert)` and one `commit()`: one network round trip to
+Postgres regardless of chunk count, instead of N. The difference is negligible for a handful of chunks but compounds
+with document length. Insert time is not measured separately (see [Observability](#observability)). It is worth adding
+if chunk counts grow enough that insert latency needs visibility distinct from `chunking_time_ms` and
+`embedding_time_ms`.
 
-The `Depends(get_db)` session is scoped to the request lifecycle — by the time a `BackgroundTasks` callback runs,
-the request has already returned a response and that generator-based session is on its way to being torn down.
-Reusing it would mean operating on a session that may already be closed, mid-rollback, or being recycled by
-SQLAlchemy's pool for an unrelated request. The background function opens its own session via
-`get_db_context()` — a `@contextlib.contextmanager` (see [DB session handling](#observability)) — independent
-of any request's lifecycle, and is responsible for its own `commit`/`rollback`. An earlier version of this did
-`closing(next(get_db()))` instead; that pattern is gone.
+### An explicit `status` column instead of inferring state from `chunk_count`
 
-**A real `UNIQUE` constraint on top of the application-level dedup check**
+`chunk_count == 0` is ambiguous. It is true for a document that has not started processing, for one that failed
+immediately (for example, chunking threw before any chunk was created), and for an empty or degenerate document that
+legitimately produces zero chunks after `completed` processing.
 
-The `get_document_by_hash()` pre-check in `create_document()` handles the common case cheaply (no DB constraint
-violation, no exception path) but can't see an in-flight, uncommitted insert from a concurrent request — that's a
-genuine TOCTOU race, not a hypothetical one, under any real concurrent load. The `UNIQUE` constraint on
-`documents.content_hash` (`add_unique_constraint_to_content_hash`) is the actual source of truth: whichever
-request commits second is rejected by Postgres itself via `IntegrityError`, which is caught and converted to the
-same `409` shape the pre-check path returns.
+An explicit `status` column removes the guesswork, and the race where a client polling on `chunk_count > 0` reports
+`completed` prematurely. That happens when it catches the document between chunk-row inserts, for example after 2 of 4
+chunks were committed but before the final `status="completed"` update lands.
+
+### A fresh DB session for background tasks
+
+The `Depends(get_db)` session is scoped to the request lifecycle. By the time a `BackgroundTasks` callback runs, the
+response has been returned and that generator-based session is on its way to being torn down. Reusing it would mean
+operating on a session that may already be closed, mid-rollback, or recycled by SQLAlchemy's pool for an unrelated
+request.
+
+The background function opens its own session via `get_db_context()`
+(see [DB session handling](#db-session-handling--get_db_context)), a `@contextlib.contextmanager` independent of any
+request, and is responsible for its own `commit` and `rollback`. An earlier version used `closing(next(get_db()))`; that
+pattern is gone.
+
+### A real `UNIQUE` constraint on top of the application-level dedup check
+
+The `get_document_by_hash()` pre-check in `create_document()` handles the common case cheaply (no constraint violation,
+no exception path). But it cannot see an in-flight, uncommitted insert from a concurrent request. That is a genuine
+TOCTOU race under any real concurrent load.
+
+The `UNIQUE` constraint on `documents.content_hash` (`add_unique_constraint_to_content_hash`) is the actual source of
+truth. Whichever request commits second is rejected by Postgres with an `IntegrityError`, which is caught and converted
+to the same `409` shape the pre-check returns.
 
 ---
 
