@@ -726,18 +726,26 @@ def test_search_handles_redis_unavailable(caplog):
 
 
 def test_search_handles_redis_timeout_error(caplog):
-    unique_phrase = "cache hit unique marker phrase alpha {uuid.uuid4()}"
+    unique_phrase = f"cache hit unique marker phrase alpha {uuid.uuid4()}"
     client.post(
         "/api/documents",
         json={"title": "Cache Hit Doc", "content": unique_phrase},
     )
     with patch("app.api.search.get_redis_client") as mock_get_client:
-        with caplog.at_level(logging.ERROR, logger="redis_status"):
+        with caplog.at_level(logging.INFO, logger="redis_status"):
             mock_get_client.return_value.get.side_effect = redis.exceptions.TimeoutError
             response = client.get("/api/search", params={"q": unique_phrase, "top_k": 3})
             assert response.status_code == 200
             assert response.headers["X-Cache"] == "MISS"
             assert any(getattr(record, "cache_status", None) == "READ_FAILED" for record in caplog.records)
+            timing_records = [
+                record
+                for record in caplog.records
+                if record.getMessage() == "search_timing"
+            ]
+            assert len(timing_records) == 1
+            timing_record = timing_records[0]
+            assert hasattr(timing_record, "redis_read_ms")
 
 
 def test_search_handles_redis_hit(caplog):
@@ -756,6 +764,20 @@ def test_search_handles_redis_hit(caplog):
         assert second_response.json() == first_response.json()
         assert first_response.headers["X-Cache"] == "MISS"
         assert any(getattr(record, "cache_status", None) == "HIT" for record in caplog.records)
+        timing_records = [
+            record
+            for record in caplog.records
+            if record.getMessage() == "search_timing"
+        ]
+
+        assert len(timing_records) == 2
+
+        timing_record = timing_records[1]
+
+        assert hasattr(timing_record, "redis_read_ms")
+        assert not hasattr(timing_record, "embedding_ms")
+        assert not hasattr(timing_record, "db_query_ms")
+        assert not hasattr(timing_record, "redis_write_ms")
 
 
 def test_search_handles_redis_miss(caplog):
@@ -770,6 +792,17 @@ def test_search_handles_redis_miss(caplog):
         assert response.status_code == 200
         assert response.headers["X-Cache"] == "MISS"
         assert any(getattr(record, "cache_status", None) == "MISS" for record in caplog.records)
+        timing_records = [
+            record
+            for record in caplog.records
+            if record.getMessage() == "search_timing"
+        ]
+        assert len(timing_records) == 1
+        timing_record = timing_records[0]
+        assert hasattr(timing_record, "redis_read_ms")
+        assert hasattr(timing_record, "embedding_ms")
+        assert hasattr(timing_record, "db_query_ms")
+        assert hasattr(timing_record, "redis_write_ms")
 
 
 class FakeSlowDatabase:
