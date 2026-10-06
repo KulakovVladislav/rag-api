@@ -451,10 +451,10 @@ Redis (see [Search Result Caching](#search-result-caching)), and the response ca
 
 **Query parameters**
 
-| Parameter | Type    | Default  | Description                        |
-|-----------|---------|----------|------------------------------------|
-| `q`       | string  | required | Search query, minimum 2 characters |
-| `top_k`   | integer | `5`      | Number of results to return        |
+| Parameter | Type    | Default  | Description                                                                   |
+|-----------|---------|----------|-------------------------------------------------------------------------------|
+| `q`       | string  | required | Search query, minimum 2 characters after trimming leading/trailing whitespace |
+| `top_k`   | integer | `5`      | Number of results to return                                                   |
 
 **Response `200`**
 
@@ -484,26 +484,17 @@ score means higher similarity**. Results are ordered by ascending cosine distanc
 
 Four guarantees on `GET /api/search`, each backed by code and a test.
 
-**1. Input validation: `q` needs at least 2 characters.**
+**1. Input validation: `q` needs at least 2 characters after normalization.**
 
-`q` is declared as `Query(min_length=2)`. A shorter value never reaches the handler (no embedding, no Redis, no DB). The
-client gets a `422` with FastAPI's standard validation body. Real response for `GET /api/search?q=h`:
+`q` is normalized once at the start of the handler with `strip().lower()`. The normalized value must contain at least 2
+characters; otherwise the handler raises `422`. Values shorter than 2 characters after normalization never reach Redis,
+embedding, or the DB.
 
-```http
-HTTP/1.1 422 Unprocessable Entity
-content-type: application/json
+For example, `GET /api/search?q=  A  ` is rejected because the normalized value is `"a"`. A query such as
+`GET /api/search?q=  Hello  ` is normalized to `"hello"` and the same canonical value is used for the cache key and
+embedding.
 
-{"detail":[{"type":"string_too_short","loc":["query","q"],"msg":"String should have at least 2 characters","input":"h","ctx":{"min_length":2}}]}
-```
-
-An empty `q=` gives the same `string_too_short` error (`"input":""`). An omitted `q` gives
-`{"type":"missing","loc":["query","q"],"msg":"Field required"}`. Both are also `422`. This is FastAPI's `detail` list,
-not the catch-all exception middleware's format, and it has no `X-Cache` header. Two-character queries such as `"ab"`
-are valid, so short abbreviations still work.
-
-> **Known limit:** length is checked on the raw string, so a query of two spaces (`q="  "`) passes validation.
-
-Test: `test_if_min_length_works`.
+Test: `test_if_min_length_works`, `test_search_normalizes_query`.
 
 **2. Redis is optional: a cache outage never fails a search.**
 
@@ -619,7 +610,7 @@ rag-api/
 │   ├── config.py                 # Pydantic settings (DB, Redis, cache TTL)
 │   └── main.py                   # FastAPI app, router registration
 ├── alembic/                      # Migrations (status, HNSW index, content_hash + metrics, unique constraint, metadata)
-├── tests/                        # Pytest suite (45 tests)
+├── tests/                        # Pytest suite (46 tests)
 ├── docker-compose.yml            # Production stack (app + Postgres/pgvector + Redis + Nginx)
 ├── docker-compose.test.yml       # Isolated test stack (Postgres + Redis containers)
 ├── Dockerfile                    # Multi-stage, non-root
@@ -640,7 +631,7 @@ effects.
 docker compose -f docker-compose.test.yml up --build --abort-on-container-exit
 ```
 
-**45 tests** cover:
+**46 tests** cover:
 
 - **Async lifecycle** — immediate `202`/`processing` response; `completed` status with the correct `chunk_count` and
   populated `*_time_ms` fields once processing finishes; a mocked failure landing on `status="failed"`; search excluding

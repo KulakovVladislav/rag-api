@@ -855,3 +855,63 @@ async def test_search_endpoint_does_not_block_event_loop(slow_fakes):
         elapsed = time.perf_counter() - start
         assert all(r.status_code == 200 for r in responses)
         assert elapsed < 4, f"took {elapsed:.2f}s"
+
+
+def test_search_normalizes_query():
+    captured_args = []
+    call_count = 0
+
+    async def capture_embedding(text):
+        nonlocal call_count
+        captured_args.append(text)
+        call_count += 1
+        return [0.0] * 384
+
+    with patch(
+            "app.api.search.get_embedding",
+            side_effect=capture_embedding,
+    ):
+        response = client.get(
+            "/api/search",
+            params={"q": "     "}
+        )
+
+        assert response.status_code == 422
+        assert call_count == 0
+        data = response.json()
+        assert "detail" in data
+        assert isinstance(data["detail"], list)
+        assert len(data["detail"]) == 1
+        assert data["detail"][0]["loc"] == ["query", "q"]
+        assert data["detail"][0]["type"] == "string_too_short"
+
+        unique_phrase = str(uuid.uuid4())
+
+        first_response = client.get(
+            "/api/search",
+            params={"q": f"  HELLO {unique_phrase}  "}
+        )
+
+        second_response = client.get(
+            "/api/search",
+            params={"q": f"hello {unique_phrase}"}
+        )
+
+        assert first_response.status_code == 200
+        assert first_response.headers["X-Cache"] == "MISS"
+        assert second_response.status_code == 200
+        assert second_response.headers["X-Cache"] == "HIT"
+        assert call_count == 1
+        assert captured_args[0] == "hello " + unique_phrase
+
+        response = client.get(
+            "/api/search",
+            params={"q": "  A  "}
+        )
+
+        assert response.status_code == 422
+        assert call_count == 1
+        data = response.json()
+        assert "detail" in data
+        assert isinstance(data["detail"], list)
+        assert len(data["detail"]) == 1

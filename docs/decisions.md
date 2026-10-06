@@ -19,7 +19,7 @@ chose), **Cost** (what we accepted).
 
 ### Query validation
 
-**Decision.** `q` requires at least 2 characters: `min_length=2`.
+**Decision.** `q` requires at least 2 characters after normalization with `strip().lower()`.
 
 **Why.** Semantic search needs a minimum of meaningful input. Two characters rule out one-character noise and still
 allow short abbreviations such as `ab`.

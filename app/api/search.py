@@ -2,11 +2,9 @@ import hashlib
 import json
 import logging
 import time
-from typing import Annotated
 
 import redis
-from fastapi import APIRouter, Depends, Response
-from fastapi import Query
+from fastapi import APIRouter, Depends, Response, HTTPException, status
 from sqlalchemy.orm import Session
 from starlette.concurrency import run_in_threadpool
 
@@ -25,11 +23,25 @@ logger = logging.getLogger("redis_status")
 @router.get("", response_model=list[SearchResult])
 async def search(
         response: Response,
-        q: Annotated[str, Query(min_length=2)],
+        q: str,
         top_k: int = 5,
         db: Session = Depends(get_db)
 ):
-    query_hash = hashlib.md5(f"{q.strip().lower()}:{top_k}".encode("utf-8")).hexdigest()
+    canon_q = q.strip().lower()
+    if len(canon_q) < 2:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=[
+                {
+                    "type": "string_too_short",
+                    "loc": ["query", "q"],
+                    "msg": "String should have at least 2 characters after normalization",
+                    "input": q,
+                }
+            ],
+        )
+
+    query_hash = hashlib.md5(f"{canon_q}:{top_k}".encode("utf-8")).hexdigest()
     cache_key = f"search:query:{query_hash}"
 
     redis_client = get_redis_client()
@@ -57,7 +69,7 @@ async def search(
 
         embedding_start_time = time.perf_counter()
         try:
-            vector = await get_embedding(q)
+            vector = await get_embedding(canon_q)
         finally:
             embedding_ms = (time.perf_counter() - embedding_start_time) * 1000
         distance = Chunk.embedding.cosine_distance(vector)
