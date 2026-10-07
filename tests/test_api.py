@@ -917,7 +917,7 @@ def test_search_normalizes_query():
         assert len(data["detail"]) == 1
 
 
-def test_bad_redis_json_handles_well(caplog):
+def test_search_corrupted_cache_value_degrades_to_miss(caplog):
     unique_phrase = f"cache hit unique marker phrase alpha {uuid.uuid4()}"
     client.post(
         "/api/documents",
