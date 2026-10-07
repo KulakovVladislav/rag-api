@@ -30,7 +30,7 @@ async def search(
     canon_q = q.strip().lower()
     if len(canon_q) < 2:
         raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
             detail=[
                 {
                     "type": "string_too_short",
