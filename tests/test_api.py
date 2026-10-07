@@ -915,3 +915,29 @@ def test_search_normalizes_query():
         assert "detail" in data
         assert isinstance(data["detail"], list)
         assert len(data["detail"]) == 1
+
+
+def test_bad_redis_json_handles_well(caplog):
+    unique_phrase = f"cache hit unique marker phrase alpha {uuid.uuid4()}"
+    client.post(
+        "/api/documents",
+        json={"title": "Cache Hit Doc", "content": unique_phrase},
+    )
+    with patch("app.api.search.get_redis_client") as mock_get_client:
+        with caplog.at_level(logging.INFO, logger="redis_status"):
+            mock_get_client.return_value.get.return_value = "это не JSON"
+            response = client.get("/api/search", params={"q": unique_phrase, "top_k": 3})
+            assert response.status_code == 200
+            assert response.headers["X-Cache"] == "MISS"
+            assert any(element.get("content") == unique_phrase for element in response.json())
+            assert any(
+                getattr(record, "cache_status", None) == "READ_FAILED" and record.levelname == "ERROR" for record in
+                caplog.records)
+            timing_records = [
+                record
+                for record in caplog.records
+                if record.getMessage() == "search_timing"
+            ]
+            assert len(timing_records) == 1
+            timing_record = timing_records[0]
+            assert hasattr(timing_record, "redis_read_ms")
