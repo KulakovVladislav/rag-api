@@ -500,7 +500,8 @@ Test: `test_if_min_length_works`, `test_search_normalizes_query`.
 
 Redis is touched twice per uncached request, and each touch is wrapped separately:
 
-- **Read fails** (`ConnectionError` or `TimeoutError` on `get`): logged at `ERROR` as `READ_FAILED`, the response gets
+- **Read fails** (`ConnectionError` or `TimeoutError` on `get`, or invalid JSON in the cached value:
+  `json.JSONDecodeError`): logged at `ERROR` as `READ_FAILED`, the response gets
   `X-Cache: MISS`, and the request carries on like a normal miss: embed the query, run pgvector, return `200` with fresh
   results.
 - **Write fails** (`ConnectionError` or `TimeoutError` on `set`): logged at `WARNING` as `WRITE_FAILED`, swallowed, and
@@ -610,7 +611,7 @@ rag-api/
 │   ├── config.py                 # Pydantic settings (DB, Redis, cache TTL)
 │   └── main.py                   # FastAPI app, router registration
 ├── alembic/                      # Migrations (status, HNSW index, content_hash + metrics, unique constraint, metadata)
-├── tests/                        # Pytest suite (46 tests)
+├── tests/                        # Pytest suite (47 tests)
 ├── docker-compose.yml            # Production stack (app + Postgres/pgvector + Redis + Nginx)
 ├── docker-compose.test.yml       # Isolated test stack (Postgres + Redis containers)
 ├── Dockerfile                    # Multi-stage, non-root
@@ -631,7 +632,7 @@ effects.
 docker compose -f docker-compose.test.yml up --build --abort-on-container-exit
 ```
 
-**46 tests** cover:
+**47 tests** cover:
 
 - **Async lifecycle** — immediate `202`/`processing` response; `completed` status with the correct `chunk_count` and
   populated `*_time_ms` fields once processing finishes; a mocked failure landing on `status="failed"`; search excluding
