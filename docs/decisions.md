@@ -24,8 +24,8 @@ chose), **Cost** (what we accepted).
 **Why.** Semantic search needs a minimum of meaningful input. Two characters rule out one-character noise and still
 allow short abbreviations such as `ab`.
 
-**Cost** The minimum length of "q" is not declared in the OpenAPI schema because app/api/search.py:26 defines it as "q:
-str" without "Query (min_length=2)".
+**Cost.** The minimum length of `q` is not declared in the OpenAPI schema because `app/api/search.py:26` defines it as
+`q: str` without `Query(min_length=2)`.
 
 ### Write the cache after the database
 

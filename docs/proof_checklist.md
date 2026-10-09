@@ -20,13 +20,13 @@ git status -sb
 git log -3 --oneline
 git rev-parse HEAD
 git rev-parse origin/main
-pytest -q
+docker compose -f docker-compose.test.yml up --build --abort-on-container-exit
 ```
 
 Verify:
 
 * `git rev-parse HEAD` and `git rev-parse origin/main` match.
-* `pytest -q` finishes successfully.
+* `docker compose -f docker-compose.test.yml up --build --abort-on-container-exit` finishes successfully.
 * The number of `passed` tests equals the number of `def test_` definitions.
 * Test names are unique.
 * No unintended uncommitted changes remain.
