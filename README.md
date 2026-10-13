@@ -49,6 +49,7 @@ background, so a 50-page document never ties up a Gunicorn worker for 10+ second
 - [Running Tests](#running-tests)
 - [Environment Variables](#environment-variables)
 - [Engineering Decisions](#engineering-decisions)
+- [Known limitations](#known-limitations)
 
 ---
 
@@ -752,6 +753,20 @@ TOCTOU race under any real concurrent load.
 The `UNIQUE` constraint on `documents.content_hash` (`add_unique_constraint_to_content_hash`) is the actual source of
 truth. Whichever request commits second is rejected by Postgres with an `IntegrityError`, which is caught and converted
 to the same `409` shape the pre-check returns.
+
+## Known limitations
+
+Current limitations of the implementation. Anything not confirmed by a test or measurement is marked “by code reading,
+not verified”.
+
+| Limitation                                                                                                                                  | Impact                                                                                                                                                                                                                                                                     | What I'll do and when                                                                                         |
+|---------------------------------------------------------------------------------------------------------------------------------------------|----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|---------------------------------------------------------------------------------------------------------------|
+| `DELETE /api/documents/{id}` does not invalidate the search cache (`documents.py:131–139`, `document_service.py:28–35`).                    | Search can return chunks from a deleted document until `search_cache_ttl` (up to 60 s).                                                                                                                                                                                    | Add cache invalidation on successful delete (to be done with the next Redis-related changes).                 |
+| Degradation time with a hung Redis is not measured; `socket_timeout` defaults to 5 s on both `get` and `set`.                               | Each Redis call can block for up to 5 s when Redis hangs. Real latency impact has not been measured.                                                                                                                                                                       | Not implemented for the duration of the freeze; to be done after protection (decision 11.10).                 |
+| `READ_FAILED` does not distinguish timeout, connection drop, and corrupted value.                                                           | Logs do not show whether the failure was a `TimeoutError`, `ConnectionError`, or `json.JSONDecodeError`.                                                                                                                                                                   | Separate the causes in logs and handlers (by code reading, not verified).                                     |
+| Redis unavailable in `invalidate_search_cache()`: by code reading the whole transaction is rolled back and the document is marked `failed`. | `db.rollback()` (`document_service.py:103`) undoes `bulk_save_objects` (`:72`) and the `completed` status. Chunks are not saved and the processing work is lost because of a cache failure. For a project where Redis is only an optimization this is a correctness issue. | Add a test and ensure cache failure does not roll back successful processing (by code reading, not verified). |
+| Other Redis errors (`ResponseError` and similar) on `get` and `set`: list from memory, not verified.                                        | Unhandled Redis exceptions can escape instead of graceful degradation.                                                                                                                                                                                                     | Compile the full list and add handling (by code reading, not verified).                                       |
+| `UnicodeDecodeError` with `decode_responses=True` is not verified.                                                                          | Corrupted cache data can raise an unhandled exception instead of `READ_FAILED`.                                                                                                                                                                                            | Verify behavior on invalid encoding (by code reading, not verified).                                          |
 
 ---
 
