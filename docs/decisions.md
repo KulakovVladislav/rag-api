@@ -151,13 +151,15 @@ A missing attribute becomes `None`, the comparison is `False`, and nothing is ra
 
 **Context.** The application isolates slow synchronous I/O with Starlette's `run_in_threadpool`. To prove that the event
 loop stays free, the tests inject latency. The database session is injected per request through `Depends`, so FastAPI's
-`app.dependency_overrides` works. The Redis client is created at module level in `app/api/search.py` through
-`redis.from_url(...)` and imported directly, so `dependency_overrides` cannot reach it.
+`app.dependency_overrides` works. The Redis client is obtained by calling the factory `get_redis_client()` (defined in
+`app/core/redis.py`, imported and invoked inside the route in `app/api/search.py:47`), so there is no module-level
+`redis_client` object that `dependency_overrides` can replace.
 
 **Decision.** A hybrid strategy:
 
 1. **Database.** Use `app.dependency_overrides` to inject a `FakeSlowDatabase`.
-2. **Redis.** Use `unittest.mock.patch` (or `monkeypatch`) on the import path `app.api.search.redis_client`.
+2. **Redis.** Use `unittest.mock.patch` (or `monkeypatch`) on the import path `app.api.search.get_redis_client` (the
+   name as imported into the module that calls it).
 
 Both fakes call a synchronous `time.sleep()`, which imitates a blocking network driver. If `run_in_threadpool` works,
 the event loop stays responsive.
@@ -167,8 +169,15 @@ the event loop stays responsive.
 - The factory `get_redis_client` is mocked at the function level rather than on an instance, because it is evaluated at
   runtime in the route body.
 - `get_embedding` is stubbed, so tests never touch third-party vector dependencies.
-- Each fake sleeps 1.0 s, and the pass threshold for the whole test is 4.0 s. As a negative control, the threaded
-  version finishes in about 3.1 s, while a blocked version scales to 5.03 s.
+- Each fake sleeps 1.0 s. The concurrency test issues 3 concurrent requests, 3 sleeps each (get, database, set). The
+  pass threshold is 4.0 s.
+- **With `run_in_threadpool` (calculated).** All three sleeps run off the event loop. Requests proceed in parallel, but
+  the three sleeps inside one request remain sequential, so each request takes 3 s and the whole test finishes in about
+  3 s.
+- **Fully blocked event loop (calculated).** No sleeps go to threads. Requests run one after another. Each request takes
+  3 s, three requests give 9 s total.
+- **Partial wrap — only `.set()` left on the loop (measured).** get and the database query run in threads (parallel
+  part ≈ 2 s), then the three `.set()` calls queue on the event loop (3 × 1 s). Measured time: 5.03 s.
 
 **Benefits.**
 
@@ -178,8 +187,8 @@ the event loop stays responsive.
 
 **Cost.**
 
-- **Brittle import path.** `mock.patch` needs the exact string `app.api.search.redis_client`. If files or imports move,
-  the patch can silently stop intercepting the client.
+- **Brittle import path.** `mock.patch` needs the exact string `app.api.search.get_redis_client`. If files or imports
+  move, the patch can silently stop intercepting the factory.
 - **Global state.** Patching module-level attributes can leak into other tests unless the patch is scoped and torn down
   inside a pytest fixture.
 
