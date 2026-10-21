@@ -630,7 +630,7 @@ Tests run against isolated PostgreSQL and Redis containers, with `tmpfs` for Pos
 effects.
 
 ```bash
-docker compose -f docker-compose.test.yml up --build --abort-on-container-exit
+docker compose -f docker-compose.test.yml up --build --exit-code-from test-runner
 ```
 
 **47 tests** cover:

@@ -223,3 +223,18 @@ in `Settings` changes, which is drift waiting to happen.
 - **Limited validation.** Every CI run now exercises the committed `.env.example`, and a missing or invalid value can
   fail the pipeline. That covers only configuration not overridden by `environment` in `docker-compose.test.yml` —
   today, `APP_TITLE`.
+
+### Согласование `requirements.txt` и `httpx2`
+
+**Контекст.** В тестах используется `import httpx`, но в `requirements.txt` эта зависимость явно не указана.
+
+**Варианты.**
+
+- Добавить `httpx` в `requirements.txt`.
+- Перевести тесты на `httpx2`.
+
+**Решение.** Перевести тесты на `httpx2`, изменив импорт на `import httpx2 as httpx`. Это позволяет сохранить
+существующие вызовы API без изменений.
+
+**Цена.** По имени `httpx` в тестах теперь используется библиотека `httpx2`, что неочевидно при чтении кода. Кроме того,
+совместимость и поведение тестов зависят от версии `httpx2` и связанных зависимостей, устанавливаемых в окружении.

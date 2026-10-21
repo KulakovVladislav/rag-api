@@ -6,7 +6,7 @@ import uuid
 from unittest.mock import AsyncMock
 from unittest.mock import patch
 
-import httpx
+import httpx2 as httpx
 import pytest
 import redis.exceptions
 from fastapi.testclient import TestClient
